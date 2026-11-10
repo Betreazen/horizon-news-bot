@@ -1,1 +1,42 @@
-{}
+{
+  "initialized": true,
+  "etag_list": "\"1142aec41f1f023495c9dd91e163a2501334b7106725bb6f192c06e4ccd77200\"",
+  "etag_nightly": "\"d9004e762660779af8095432743b5114bfa4cfe38a3b2bcf53d70c04e51090df\"",
+  "seen_releases": [
+    "Horizon launcher 0.2.34",
+    "Horizon launcher 0.2.35",
+    "Horizon launcher 0.2.36",
+    "Horizon launcher 0.2.37",
+    "Nightly 2026-11-03 · 2944480",
+    "Horizon launcher 0.2.38",
+    "Horizon launcher 0.2.39",
+    "Horizon launcher 0.2.40",
+    "Nightly 2026-11-04 · 6475f62",
+    "Horizon launcher 0.2.41",
+    "Horizon launcher 0.2.42",
+    "Nightly 2026-11-05 · 66f3981",
+    "Horizon launcher 0.2.43",
+    "Horizon launcher 0.2.44",
+    "Horizon launcher 0.2.45",
+    "Horizon launcher 0.2.46",
+    "Horizon launcher 0.2.47",
+    "Horizon launcher 0.2.48",
+    "Horizon launcher 0.2.49",
+    "Horizon launcher 0.2.50",
+    "Nightly 2026-11-07 · 2ebf00a",
+    "Horizon launcher 0.2.51",
+    "Horizon launcher 0.2.52",
+    "Horizon launcher 0.2.53",
+    "Horizon launcher 0.2.54",
+    "Horizon launcher 0.2.55",
+    "Horizon launcher 0.2.56",
+    "Horizon launcher 0.2.57",
+    "Horizon launcher 0.2.58",
+    "Nightly 2026-11-08 · fdc87ae"
+  ],
+  "seen_items": [
+    "#11894",
+    "#11948",
+    "#11981"
+  ]
+}
