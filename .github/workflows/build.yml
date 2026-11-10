@@ -9,11 +9,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
+# Builds queue up instead of cancelling each other, so an upload is never
+# cut off halfway.
 concurrency:
   group: build
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   TARGET: x86_64-unknown-linux-musl
@@ -23,8 +25,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      # Only the last step uses this, to upload the binary.
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Build scripts of dependencies run below; they get no token.
+          persist-credentials: false
 
       - name: Install the static Linux target
         run: |

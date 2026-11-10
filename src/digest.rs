@@ -4,15 +4,22 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::github::Release;
-use crate::parse::{Item, parse_body};
+use crate::parse::{Item, clip, parse_body};
 use crate::state::State;
 
 /// Lines shown per section; the rest are summed up as "and N more".
 pub const MAX_LINES_PER_SECTION: usize = 12;
+/// Sections shown per post. Horizon uses two or three.
+const MAX_SECTIONS_PER_BLOCK: usize = 6;
 /// How many look-alike lines it takes to fold them into one.
 const MIN_GROUP_TO_COLLAPSE: usize = 3;
-/// Words compared at each end of a line to call two lines look-alikes.
-const SHAPE_EDGE_WORDS: usize = 3;
+/// Words that must match at each end of two lines to call them
+/// look-alikes. Four at each end leaves only a word or two to differ in a
+/// typical line, such as the language in "the 155 strings Kazakh still
+/// shows in English".
+const SHAPE_EDGE_WORDS: usize = 4;
+/// Release names are stored in the state file, so they are kept short.
+const MAX_KEY_CHARS: usize = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -71,8 +78,12 @@ pub fn plan(releases: &[Release], state: &State) -> Plan {
         silent_releases: to_skip.iter().map(|r| release_key(r)).collect(),
     };
 
+    // A release published before its notes were written has nothing to
+    // parse yet. It is left unrecorded, so it is looked at again once the
+    // notes appear.
     let (launcher, game): (Vec<&Release>, Vec<&Release>) = to_post
         .into_iter()
+        .filter(|r| !parse_body(r.body.as_deref().unwrap_or_default()).is_empty())
         .partition(|r| kind_of(r) == Kind::Launcher);
     let groups = game
         .into_iter()
@@ -131,8 +142,8 @@ pub fn kind_of(release: &Release) -> Kind {
 /// the name identifies a release better than the tag does.
 pub fn release_key(release: &Release) -> String {
     match release.name.as_deref().map(str::trim) {
-        Some(name) if !name.is_empty() => name.to_string(),
-        _ => release.tag.clone(),
+        Some(name) if !name.is_empty() => clip(name, MAX_KEY_CHARS),
+        _ => clip(&release.tag, MAX_KEY_CHARS),
     }
 }
 
@@ -155,11 +166,12 @@ fn build_block(kind: Kind, group: &[&Release], seen_items: &mut HashSet<String>)
         }
     }
 
-    let sections: Vec<BlockSection> = merged
+    let all_sections: Vec<BlockSection> = merged
         .into_iter()
         .filter(|(_, items)| !items.is_empty())
         .map(|(title, items)| capped(title, collapse(items)))
         .collect();
+    let sections = within_section_cap(all_sections);
     if sections.is_empty() {
         return None;
     }
@@ -173,6 +185,21 @@ fn build_block(kind: Kind, group: &[&Release], seen_items: &mut HashSet<String>)
         release_keys: group.iter().map(|r| release_key(r)).collect(),
         item_keys,
     })
+}
+
+/// Keeps the first sections and counts the changes of the rest as hidden
+/// in the last one kept, so the post still says how much it left out.
+fn within_section_cap(sections: Vec<BlockSection>) -> Vec<BlockSection> {
+    let overflow: usize = sections
+        .iter()
+        .skip(MAX_SECTIONS_PER_BLOCK)
+        .map(|section| section.hidden + section.lines.iter().map(|l| 1 + l.similar).sum::<usize>())
+        .sum();
+    let mut kept: Vec<BlockSection> = sections.into_iter().take(MAX_SECTIONS_PER_BLOCK).collect();
+    if let Some(last) = kept.last_mut() {
+        last.hidden += overflow;
+    }
+    kept
 }
 
 fn label(kind: Kind, group: &[&Release]) -> String {
@@ -443,6 +470,75 @@ mod tests {
         let plan = plan(&releases, &state);
         assert!(plan.blocks.is_empty());
         assert_eq!(plan.silent_releases, ["Nightly A"]);
+    }
+
+    #[test]
+    fn a_release_without_notes_yet_is_looked_at_again_later() {
+        let empty = [release(
+            "nightly",
+            "Nightly A",
+            "2026-11-09T11:00:00Z",
+            "Notes to follow.",
+        )];
+        let first = plan(&empty, &running());
+        assert_eq!(first, Plan::default(), "neither posted nor recorded");
+
+        let filled = [release(
+            "nightly",
+            "Nightly A",
+            "2026-11-09T11:00:00Z",
+            "### New\n- Thing (#1)",
+        )];
+        assert_eq!(plan(&filled, &running()).blocks.len(), 1);
+    }
+
+    #[test]
+    fn different_changes_with_a_common_start_and_end_are_not_folded() {
+        let body = "### Fixed\n\
+            - Fixed crash when opening the chest in the nether (#1)\n\
+            - Fixed crash when closing the door in the nether (#2)\n\
+            - Fixed crash when breaking the bed in the nether (#3)";
+        let releases = [release(
+            "nightly",
+            "Nightly A",
+            "2026-11-09T11:00:00Z",
+            body,
+        )];
+        let plan = plan(&releases, &running());
+        let section = &plan.blocks[0].sections[0];
+        assert_eq!(section.lines.len(), 3);
+        assert!(section.lines.iter().all(|line| line.similar == 0));
+    }
+
+    #[test]
+    fn extra_sections_are_counted_as_hidden_not_dropped_silently() {
+        let body: String = (1..=MAX_SECTIONS_PER_BLOCK + 2)
+            .map(|n| format!("### Part {n}\n- Change (#{n})\n"))
+            .collect();
+        let releases = [release(
+            "nightly",
+            "Nightly A",
+            "2026-11-09T11:00:00Z",
+            &body,
+        )];
+        let plan = plan(&releases, &running());
+        let block = &plan.blocks[0];
+
+        assert_eq!(block.sections.len(), MAX_SECTIONS_PER_BLOCK);
+        assert_eq!(block.sections.last().unwrap().hidden, 2);
+        assert_eq!(block.item_keys.len(), MAX_SECTIONS_PER_BLOCK + 2);
+    }
+
+    #[test]
+    fn a_very_long_release_name_makes_a_short_key() {
+        let name = "N".repeat(5000);
+        let long = release(
+            "nightly",
+            &name,
+            "2026-11-09T11:00:00Z",
+            "### New\n- Thing (#1)",
+        );
+        assert_eq!(release_key(&long).chars().count(), MAX_KEY_CHARS);
     }
 
     #[test]

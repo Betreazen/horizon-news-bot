@@ -24,7 +24,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// A translation much longer than its source is the model rambling.
 const MAX_LENGTH_RATIO: usize = 3;
 const LENGTH_SLACK: usize = 40;
+/// A translation under a third of its source has dropped most of it.
+const MIN_LENGTH_DIVISOR: usize = 3;
+/// Share of letters that must be Cyrillic. Kept names and identifiers stay
+/// Latin, so the bar is a quarter, not a half.
+const MIN_CYRILLIC_DIVISOR: usize = 4;
 const MIN_DOTTED_PART: usize = 2;
+/// Things a translation must never introduce on its own.
+const LINK_MARKERS: [&str; 3] = ["://", "@", "t.me/"];
+/// The only variables the model server gets. It is third-party code, so it
+/// must not inherit the bot token or the GitHub token.
+const PASSED_ENV: [&str; 2] = ["PATH", "HOME"];
 
 pub trait Translator {
     /// Russian for one line, or `None` when no trustworthy translation came back.
@@ -88,6 +98,12 @@ impl LlamaServer {
             .stdin(Stdio::null())
             .stdout(log)
             .stderr(log_copy);
+        command.env_clear();
+        for name in PASSED_ENV {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
         // The release archive ships its shared libraries next to the binary.
         if let Some(dir) = binary.parent() {
             command.env("LD_LIBRARY_PATH", dir);
@@ -159,7 +175,15 @@ impl LlamaServer {
         if status != 200 {
             return Err(format!("llama-server answered HTTP {status}: {reply}"));
         }
-        reply["choices"][0]["message"]["content"]
+        let choice = &reply["choices"][0];
+        // Anything but a natural stop is a reply cut off at the token limit.
+        if choice["finish_reason"].as_str() != Some("stop") {
+            return Err(format!(
+                "llama-server did not finish its reply ({})",
+                choice["finish_reason"]
+            ));
+        }
+        choice["message"]["content"]
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| format!("llama-server reply has no text: {reply}"))
@@ -197,22 +221,44 @@ pub fn log_path() -> PathBuf {
 }
 
 /// Checks a model reply against its source line and returns the cleaned
-/// translation, or `None` when the reply cannot be trusted:
-/// it must be Russian, of a sane length, and carry exactly the numbers and
-/// code identifiers of the source.
+/// translation, or `None` when the reply cannot be trusted. The reply must
+/// be a single line, mostly Russian, of a sane length, carry the numbers of
+/// the source in the same order, keep its code identifiers letter for
+/// letter, and add no link or mention of its own.
 pub fn accept(source: &str, reply: &str) -> Option<String> {
-    let line = reply.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let mut lines = reply.lines().map(str::trim).filter(|line| !line.is_empty());
+    // A second line is a preface or a note, and which line is the
+    // translation is then a guess.
+    let (line, None) = (lines.next()?, lines.next()) else {
+        return None;
+    };
     let line = unwrap_quotes(line, source);
 
-    let is_russian = line
-        .chars()
-        .any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'));
-    let length_limit = source.chars().count() * MAX_LENGTH_RATIO + LENGTH_SLACK;
-    let sane_length = line.chars().count() <= length_limit;
-    let same_numbers = numbers(source) == numbers(line);
-    let keeps_code = code_tokens(source).all(|token| line.contains(token));
+    let source_len = source.chars().count();
+    let len = line.chars().count();
+    let checks = [
+        is_mostly_russian(line),
+        len * MIN_LENGTH_DIVISOR >= source_len,
+        len <= source_len * MAX_LENGTH_RATIO + LENGTH_SLACK,
+        numbers(source) == numbers(line),
+        code_tokens(source).all(|token| contains_word(line, token)),
+        !LINK_MARKERS
+            .iter()
+            .any(|marker| line.contains(marker) && !source.contains(marker)),
+    ];
+    checks
+        .iter()
+        .all(|passed| *passed)
+        .then(|| line.to_string())
+}
 
-    (is_russian && sane_length && same_numbers && keeps_code).then(|| line.to_string())
+fn is_mostly_russian(line: &str) -> bool {
+    let letters = line.chars().filter(|c| c.is_alphabetic()).count();
+    let cyrillic = line
+        .chars()
+        .filter(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'))
+        .count();
+    cyrillic > 0 && cyrillic * MIN_CYRILLIC_DIVISOR >= letters
 }
 
 /// Models like to wrap an answer in quotes the source never had.
@@ -221,42 +267,62 @@ fn unwrap_quotes<'a>(line: &'a str, source: &str) -> &'a str {
     for (open, close) in PAIRS {
         let wrapped = line.starts_with(open) && line.ends_with(close) && line.chars().count() > 1;
         if wrapped && !source.starts_with(open) {
-            return line[open.len_utf8()..line.len() - close.len_utf8()].trim();
+            let inner = &line[open.len_utf8()..line.len() - close.len_utf8()];
+            // Quotes inside mean the outer pair belongs to the sentence.
+            if !inner.contains([open, close]) {
+                return inner.trim();
+            }
         }
     }
     line
 }
 
-/// Every run of digits, sorted, so word order may change but values may not.
+/// Every run of digits, in order. "From 8 to 16" and "from 16 to 8" share
+/// their numbers and mean the opposite, so the order is part of the check.
 fn numbers(text: &str) -> Vec<&str> {
-    let mut runs: Vec<&str> = text
-        .split(|c: char| !c.is_ascii_digit())
+    text.split(|c: char| !c.is_ascii_digit())
         .filter(|run| !run.is_empty())
-        .collect();
-    runs.sort_unstable();
-    runs
+        .collect()
 }
 
-/// Words that are code rather than prose: `snake_case`, `dotted.names` and
-/// `camelCase`. They must survive translation letter for letter.
+/// Words that are code rather than prose: `snake_case`, `dotted.names`,
+/// `camelCase`, `/commands` and `namespaced:ids`. They must survive
+/// translation letter for letter.
 fn code_tokens(text: &str) -> impl Iterator<Item = &str> {
-    text.split_whitespace()
-        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+    text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';'))
+        .map(|word| {
+            word.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/')
+                .trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+        })
         .filter(|word| word.is_ascii() && !word.contains('\''))
         .filter(|word| is_code(word))
 }
 
 fn is_code(word: &str) -> bool {
     let bytes = word.as_bytes();
-    let snake = bytes
-        .windows(3)
-        .any(|w| w[1] == b'_' && w[0].is_ascii_alphanumeric() && w[2].is_ascii_alphanumeric());
+    let joined_by = |separator: u8| {
+        bytes.windows(3).any(|w| {
+            w[1] == separator && w[0].is_ascii_alphanumeric() && w[2].is_ascii_alphanumeric()
+        })
+    };
     // Parts of two letters or more, so "e.g" and version numbers are not code.
     let dotted = word.contains('.') && word.split('.').all(|part| part.len() >= MIN_DOTTED_PART);
     let camel = bytes
         .windows(2)
         .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase());
-    snake || dotted || camel
+    let command = bytes.len() > 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic();
+    joined_by(b'_') || joined_by(b':') || dotted || camel || command
+}
+
+/// Whether `token` stands in `text` as a whole word, so `get_foo` is not
+/// satisfied by `get_foo_bar`.
+fn contains_word(text: &str, token: &str) -> bool {
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(token).any(|(start, found)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + found.len()..].chars().next();
+        !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+    })
 }
 
 #[cfg(test)]
@@ -277,12 +343,66 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_line_of_a_reply_is_used() {
-        let result = accept(
-            "Boats stop",
-            "\n  Лодки останавливаются  \n\nПримечание: перевод дословный.",
-        );
+    fn blank_lines_around_the_translation_are_ignored() {
+        let result = accept("Boats stop", "\n  Лодки останавливаются  \n\n");
         assert_eq!(result.as_deref(), Some("Лодки останавливаются"));
+    }
+
+    #[test]
+    fn a_reply_of_several_lines_is_rejected() {
+        let with_note = "Лодки останавливаются\n\nПримечание: перевод дословный.";
+        let with_preface = "Вот перевод:\nЛодки останавливаются";
+        assert_eq!(accept("Boats stop", with_note), None);
+        assert_eq!(accept("Boats stop", with_preface), None);
+    }
+
+    #[test]
+    fn a_reply_that_drops_most_of_the_line_is_rejected() {
+        let source = "Boats no longer stop when colliding with a minecart on rails";
+        assert_eq!(accept(source, "Лодки"), None);
+    }
+
+    #[test]
+    fn a_mostly_english_reply_is_rejected() {
+        let source = "Crowded mobs take cramming damage, as vanilla";
+        let reply = "The user wants me to translate this Minecraft changelog line: мобы";
+        assert_eq!(accept(source, reply), None);
+    }
+
+    #[test]
+    fn a_reply_may_keep_many_latin_names() {
+        let source = "horizon-client: discord, friends and heartbeat features (default on)";
+        let reply = "horizon-client: функции discord, friends и heartbeat (включены по умолчанию)";
+        assert!(accept(source, reply).is_some());
+    }
+
+    #[test]
+    fn a_link_or_mention_the_source_never_had_is_rejected() {
+        assert_eq!(
+            accept(
+                "Boats stop",
+                "Лодки останавливаются, см. https://example.test"
+            ),
+            None
+        );
+        assert_eq!(
+            accept("Boats stop", "Лодки останавливаются, спасибо @someone"),
+            None
+        );
+        let source = "Docs moved to https://playhorizon.dev for good";
+        assert!(
+            accept(
+                source,
+                "Документация переехала на https://playhorizon.dev насовсем"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn quotes_that_belong_to_the_sentence_stay() {
+        let reply = "\"Лодки\" и \"вагонетки\"";
+        assert_eq!(accept("Boats and minecarts", reply).as_deref(), Some(reply));
     }
 
     #[test]
@@ -338,8 +458,50 @@ mod tests {
     }
 
     #[test]
-    fn numbers_may_change_order() {
-        assert!(accept("From 124 to 222 fps", "До 222 кадр/с вместо 124").is_some());
+    fn swapped_numbers_are_rejected() {
+        let source = "Render distance raised from 8 to 16 chunks";
+        assert!(accept(source, "Дальность прорисовки увеличена с 8 до 16 чанков").is_some());
+        assert_eq!(
+            accept(source, "Дальность прорисовки снижена с 16 до 8 чанков"),
+            None
+        );
+    }
+
+    #[test]
+    fn commands_and_namespaced_ids_must_survive_unchanged() {
+        let source = "The /gamemode command accepts minecraft:spectator again";
+        assert!(
+            accept(
+                source,
+                "Команда /gamemode снова принимает minecraft:spectator"
+            )
+            .is_some()
+        );
+        assert_eq!(
+            accept(source, "Команда /режим снова принимает minecraft:spectator"),
+            None
+        );
+        assert_eq!(
+            accept(source, "Команда /gamemode снова принимает наблюдателя"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_identifier_inside_a_longer_one_does_not_count() {
+        let source = "The toast_add hook is cancellable";
+        assert!(accept(source, "Хук toast_add можно отменить").is_some());
+        assert_eq!(accept(source, "Хук toast_add_event можно отменить"), None);
+    }
+
+    #[test]
+    fn identifiers_in_a_comma_list_are_checked_one_by_one() {
+        let source = "Hooks getFoo,setBar are public";
+        assert!(accept(source, "Хуки getFoo, setBar стали публичными").is_some());
+        assert_eq!(
+            accept(source, "Хуки getFoo, установитьBar стали публичными"),
+            None
+        );
     }
 
     #[test]

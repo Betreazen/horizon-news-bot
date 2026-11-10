@@ -7,18 +7,26 @@ use serde_json::{Value, json};
 use ureq::Agent;
 
 use crate::digest::{Block, BlockSection, Kind, Line};
+use crate::parse::clip;
 
 /// Telegram allows 4096 characters after formatting. Counting the markup
 /// too leaves a wide margin.
 pub const MESSAGE_LIMIT: usize = 3800;
+/// Caps on text taken from releases and from the model. With them no
+/// rendered line can outgrow a message, even if every character needs
+/// escaping, so a single odd release cannot jam the queue.
+const MAX_LINE_CHARS: usize = 500;
+const MAX_LABEL_CHARS: usize = 120;
 const MAX_ATTEMPTS: u32 = 4;
 const MAX_RETRY_WAIT_SECS: u64 = 60;
+const SERVER_ERROR_WAIT: Duration = Duration::from_secs(3);
 const SOURCE_REPO_URL: &str = "https://github.com/horizon-rust/horizon";
 
 pub fn render(block: &Block) -> String {
+    let label = clip(&block.label, MAX_LABEL_CHARS);
     let title = match block.kind {
-        Kind::Game => format!("🎮 Horizon {}", block.label),
-        Kind::Launcher => format!("🚀 Лаунчер Horizon {}", block.label),
+        Kind::Game => format!("🎮 Horizon {label}"),
+        Kind::Launcher => format!("🚀 Лаунчер Horizon {label}"),
     };
     let mut parts = vec![format!("<b>{}</b>", escape(&title))];
     parts.extend(block.sections.iter().map(render_section));
@@ -43,7 +51,7 @@ fn render_section(section: &BlockSection) -> String {
 }
 
 fn render_line(line: &Line) -> String {
-    let mut text = format!("• {}", escape(&line.text));
+    let mut text = format!("• {}", escape(&clip(&line.text, MAX_LINE_CHARS)));
     if let Some(pr) = line.pr {
         text.push_str(&format!(
             " (<a href=\"{SOURCE_REPO_URL}/pull/{pr}\">#{pr}</a>)"
@@ -117,6 +125,10 @@ pub fn split(text: &str, limit: usize) -> Vec<String> {
 }
 
 /// Sends one block, in as many messages as its length needs.
+///
+/// A block that needs two messages and fails on the second is sent again
+/// from the top by the next run, so its first part can arrive twice. That
+/// is the price of never dropping a part.
 pub fn send_block(agent: &Agent, token: &str, chat_id: &str, block: &Block) -> Result<(), String> {
     split(&render(block), MESSAGE_LIMIT)
         .iter()
@@ -150,13 +162,19 @@ fn send(agent: &Agent, token: &str, chat_id: &str, text: &str) -> Result<(), Str
             sleep(Duration::from_secs(wait.min(MAX_RETRY_WAIT_SECS)));
             continue;
         }
+        // Telegram answered that it failed, so nothing was delivered and a
+        // retry cannot duplicate the message.
+        if status >= 500 {
+            sleep(SERVER_ERROR_WAIT);
+            continue;
+        }
         let description = reply["description"].as_str().unwrap_or("no description");
         return Err(format!(
             "Telegram refused the message: HTTP {status}: {description}"
         ));
     }
     Err(format!(
-        "Telegram kept rate-limiting after {MAX_ATTEMPTS} attempts"
+        "Telegram kept refusing or failing after {MAX_ATTEMPTS} attempts"
     ))
 }
 
@@ -212,6 +230,42 @@ mod tests {
 
 <a href=\"https://github.com/horizon-rust/horizon/releases/tag/nightly\">Релиз на GitHub</a>";
         assert_eq!(render(&block()), expected);
+    }
+
+    /// The worst a release can do: every text at its cap and made only of
+    /// characters that grow sixfold when escaped.
+    #[test]
+    fn no_line_of_the_worst_block_outgrows_a_message() {
+        let hostile = "\"".repeat(100_000);
+        let worst = Block {
+            label: hostile.clone(),
+            sections: vec![BlockSection {
+                title: "\"".repeat(60),
+                lines: vec![line(&hostile, Some(u32::MAX), usize::MAX); 12],
+                hidden: usize::MAX,
+            }],
+            ..block()
+        };
+
+        let rendered = render(&worst);
+        let longest = rendered.lines().map(|l| l.chars().count()).max().unwrap();
+        assert!(longest <= MESSAGE_LIMIT, "longest line is {longest}");
+
+        let parts = split(&rendered, MESSAGE_LIMIT);
+        assert!(parts.len() > 1);
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.chars().count() <= MESSAGE_LIMIT)
+        );
+        // Every part is whole HTML: each tag it opens, it closes.
+        for part in &parts {
+            for tag in ["b", "i", "a"] {
+                let opened = part.matches(&format!("<{tag}")).count();
+                let closed = part.matches(&format!("</{tag}>")).count();
+                assert_eq!(opened, closed, "<{tag}> in {part:.80}");
+            }
+        }
     }
 
     #[test]

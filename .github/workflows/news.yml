@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: news
@@ -29,17 +29,23 @@ jobs:
   news:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      # Only the last step uses this, to push the state file.
+      contents: write
     steps:
       - name: Check out the state branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: state
           path: state
+          # The token must not sit in .git/config while downloaded
+          # programs run. The last step passes it to git explicitly.
+          persist-credentials: false
 
       - name: Download the bot
         run: |
           curl -sSfL -o bot \
-            "https://github.com/${{ github.repository }}/releases/download/bot/horizon-news-bot"
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/bot/horizon-news-bot"
           chmod +x bot
 
       - name: Look for news
@@ -61,6 +67,7 @@ jobs:
           printf '%s  %s\n' "$LLAMA_SHA256" llm/llama.tar.gz "$MODEL_SHA256" llm/model.gguf | sha256sum --check
           tar -xzf llm/llama.tar.gz -C llm/llama
 
+      # The bot hands none of these variables on to the model server.
       - name: Post the news
         if: steps.check.outputs.waiting != '0'
         env:
@@ -80,11 +87,14 @@ jobs:
       - name: Save the state
         if: always()
         working-directory: state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           if [ -n "$(git status --porcelain)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add state.json
             git commit -q -m "state: $(date -u +%Y-%m-%dT%H:%MZ)"
-            git push -q
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)" \
+              push -q origin HEAD:state
           fi

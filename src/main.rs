@@ -135,15 +135,16 @@ fn post(args: &Args, agent: &Agent, state: State, plan: Plan, etags: Etags) -> R
                 Ok(())
             }
         };
-        match sent {
-            Ok(()) => {
-                eprintln!("posted: {}", block.label);
-                next = next.with_seen(block.release_keys, block.item_keys);
-            }
-            Err(error) => {
-                failure = Some(error);
-                break;
-            }
+        // Saved after every post: if the run is killed later, what was
+        // already sent is not sent again.
+        let recorded = sent.and_then(|()| {
+            eprintln!("posted: {:?}", block.label);
+            next = next.clone().with_seen(block.release_keys, block.item_keys);
+            save(args, &next)
+        });
+        if let Err(error) = recorded {
+            failure = Some(error);
+            break;
         }
     }
     drop(translator);
@@ -152,10 +153,18 @@ fn post(args: &Args, agent: &Agent, state: State, plan: Plan, etags: Etags) -> R
     if failure.is_none() {
         next = next.with_etags(etags);
     }
-    if !args.dry_run {
-        next.save(&args.state_path)?;
+    match (failure, save(args, &next)) {
+        (Some(failure), Err(save_error)) => Err(format!("{failure}; and then {save_error}")),
+        (Some(failure), Ok(())) => Err(failure),
+        (None, saved) => saved,
     }
-    failure.map_or(Ok(()), Err)
+}
+
+fn save(args: &Args, state: &State) -> Result<(), String> {
+    if args.dry_run {
+        return Ok(());
+    }
+    state.save(&args.state_path)
 }
 
 fn translator_from_env() -> Result<Box<dyn Translator>, String> {

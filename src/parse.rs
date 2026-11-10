@@ -3,6 +3,8 @@
 //! Only bullet lines under a `### Heading` count. Everything else in a
 //! release body (download notes, thanks, disclaimers) is not news.
 
+use std::collections::HashSet;
+
 /// One changelog line, with its trailing `(#123, fixes #45)` taken off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
@@ -20,22 +22,43 @@ pub struct Section {
     pub items: Vec<Item>,
 }
 
+/// Longest item text kept. Real changelog lines run to about 150
+/// characters; the cap keeps one runaway line from flooding a message.
+const MAX_ITEM_CHARS: usize = 300;
+const MAX_TITLE_CHARS: usize = 60;
+
 pub fn parse_body(body: &str) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
+    let mut used_keys: HashSet<String> = HashSet::new();
+    let mut in_section = false;
+
     for line in body.lines().map(str::trim) {
         if let Some(title) = line.strip_prefix("### ") {
             sections.push(Section {
-                title: title.trim().to_string(),
+                title: clip(title.trim(), MAX_TITLE_CHARS),
                 items: Vec::new(),
             });
+            in_section = true;
+        } else if line.starts_with('#') || is_rule(line) {
+            // Any other heading, or a horizontal rule, ends the section, so
+            // a bullet list under "## Downloads" is not taken for changes.
+            in_section = false;
         } else if let Some(bullet) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            if let (Some(section), Some(item)) = (sections.last_mut(), parse_item(bullet)) {
+            let item = parse_item(bullet).and_then(|item| unique(item, &mut used_keys));
+            if let (true, Some(section), Some(item)) = (in_section, sections.last_mut(), item) {
                 section.items.push(item);
             }
         }
     }
     sections.retain(|section| !section.items.is_empty());
     sections
+}
+
+fn is_rule(line: &str) -> bool {
+    line.len() >= 3
+        && ['-', '*', '_']
+            .iter()
+            .any(|mark| line.chars().all(|c| c == *mark))
 }
 
 fn parse_item(bullet: &str) -> Option<Item> {
@@ -48,10 +71,35 @@ fn parse_item(bullet: &str) -> Option<Item> {
         None => format!("t:{:016x}", fnv1a(&text.to_lowercase())),
     };
     Some(Item {
-        text: text.to_string(),
+        text: clip(text, MAX_ITEM_CHARS),
         pr,
         key,
     })
+}
+
+/// Two different bullets may name the same pull request. The first keeps
+/// the plain key; a later one with other text gets a key of its own, and an
+/// exact repeat is dropped.
+fn unique(item: Item, used_keys: &mut HashSet<String>) -> Option<Item> {
+    let text_hash = fnv1a(&item.text.to_lowercase()) & 0xffff_ffff;
+    let own_key = format!("{}:{text_hash:08x}", item.key);
+    if used_keys.insert(item.key.clone()) {
+        used_keys.insert(own_key);
+        return Some(item);
+    }
+    used_keys.insert(own_key.clone()).then_some(Item {
+        key: own_key,
+        ..item
+    })
+}
+
+/// Shortens text to `max` characters, marking the cut with an ellipsis.
+pub fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end())
 }
 
 /// Strips trailing parenthesised groups that carry `#number` references and
@@ -192,6 +240,60 @@ mod tests {
             item("Shader packs are gone").key,
             item("Shader packs are back").key
         );
+    }
+
+    #[test]
+    fn bullets_under_other_headings_are_not_changes() {
+        let body = "### Fixed\n- Real fix (#1)\n\n## Downloads\n- file.zip\n\n#### Notes\n- a note";
+        let sections = parse_body(body);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].items.len(), 1);
+        assert_eq!(sections[0].items[0].text, "Real fix");
+    }
+
+    #[test]
+    fn a_horizontal_rule_ends_the_section() {
+        let sections = parse_body("### Fixed\n- Real fix (#1)\n\n---\n- Not a change");
+        assert_eq!(sections[0].items.len(), 1);
+    }
+
+    #[test]
+    fn two_bullets_for_one_pr_are_both_kept() {
+        let sections = parse_body("### Fixed\n- Fix A (#100)\n- Fix B (#100)");
+        let keys: Vec<&str> = sections[0].items.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], "#100");
+        assert!(keys[1].starts_with("#100:"));
+        assert_ne!(keys[0], keys[1]);
+    }
+
+    #[test]
+    fn keys_are_the_same_on_every_parse() {
+        let body = "### Fixed\n- Fix A (#100)\n- Fix B (#100)";
+        assert_eq!(parse_body(body), parse_body(body));
+    }
+
+    #[test]
+    fn an_exact_repeat_of_a_bullet_is_dropped() {
+        let body = "### New\n- Fix A (#100)\n### Fixed\n- Fix A (#100)\n- Fix A (#100)";
+        let sections = parse_body(body);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].items.len(), 1);
+    }
+
+    #[test]
+    fn a_runaway_line_is_clipped() {
+        let long = "word ".repeat(500);
+        let parsed = item(&format!("{long}(#7)"));
+        assert_eq!(parsed.text.chars().count(), MAX_ITEM_CHARS);
+        assert!(parsed.text.ends_with('…'));
+        assert_eq!(parsed.pr, Some(7));
+    }
+
+    #[test]
+    fn clip_leaves_short_text_alone_and_counts_characters() {
+        assert_eq!(clip("привет", 6), "привет");
+        assert_eq!(clip("привет мир", 7), "привет…");
     }
 
     #[test]
