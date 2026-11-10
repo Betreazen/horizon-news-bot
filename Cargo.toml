@@ -2,7 +2,7 @@
 name = "horizon-news-bot"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 description = "Posts confirmed Horizon release news to Telegram in Russian"
 publish = false
 
@@ -10,6 +10,15 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+
+[dev-dependencies]
+# Benchmarks only. Without the default features it pulls in no plotting
+# or thread-pool crates.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "core"
+harness = false
 
 [lints.rust]
 unsafe_code = "forbid"

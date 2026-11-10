@@ -1,0 +1,127 @@
+name: bench
+
+# Measurements on a real runner, started by hand. Nothing here posts to
+# Telegram or touches the state. Results are logged in docs/perf-log.md.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_BUILD: b12110
+  MODEL_URL: https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/bfc15c382204943c3a8fff0c750b94ae2364d7a3/gemma-4-E4B-it-Q4_K_M.gguf
+  MODEL_SHA256: 85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87
+
+jobs:
+  # Where a news run spends its time: getting the model, and translating.
+  model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download, one stream against several
+        run: |
+          set -euo pipefail
+          nproc; free -g | sed -n 2p
+          t0=$(date +%s.%N)
+          curl -sSfL -o model.gguf "$MODEL_URL"
+          echo "RESULT download curl: $(echo "$(date +%s.%N) - $t0" | bc) s"
+          rm model.gguf
+          for streams in 4 8 16; do
+            t0=$(date +%s.%N)
+            aria2c -q -x "$streams" -s "$streams" -k 16M --file-allocation=none -o model.gguf "$MODEL_URL"
+            echo "RESULT download aria2c x$streams: $(echo "$(date +%s.%N) - $t0" | bc) s"
+            [ "$streams" = 16 ] || rm model.gguf
+          done
+
+      - name: Checksum and unpack
+        run: |
+          set -euo pipefail
+          t0=$(date +%s.%N)
+          echo "$MODEL_SHA256  model.gguf" | sha256sum --check
+          echo "RESULT sha256 of the model: $(echo "$(date +%s.%N) - $t0" | bc) s"
+          curl -sSfL -o llama.tar.gz \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_BUILD}/llama-${LLAMA_BUILD}-bin-ubuntu-x64.tar.gz"
+          t0=$(date +%s.%N)
+          mkdir llama && tar -xzf llama.tar.gz -C llama
+          echo "RESULT unpack llama.cpp: $(echo "$(date +%s.%N) - $t0" | bc) s"
+
+      - name: Translate with 2, 3 and 4 threads, and with a short prompt
+        run: |
+          set -euo pipefail
+          bin=$(find llama -name llama-server -type f | head -n 1)
+          export LD_LIBRARY_PATH="$(dirname "$bin")"
+          # The rules without the glossary: how much does the glossary cost,
+          # and what does it buy?
+          sed '/^- Use the official Russian Minecraft terms/d' src/prompt.txt > short-prompt.txt
+
+          run_case() {
+            local name=$1 threads=$2 prompt_file=$3
+            local system; system=$(cat "$prompt_file")
+            local t0; t0=$(date +%s.%N)
+            "$bin" -m model.gguf -c 4096 -t "$threads" --host 127.0.0.1 --port 8089 > "server-$name.log" 2>&1 &
+            local pid=$!
+            for _ in $(seq 1 300); do
+              curl -sf http://127.0.0.1:8089/health > /dev/null && break
+              sleep 0.2
+            done
+            echo "RESULT $name: model loaded in $(echo "$(date +%s.%N) - $t0" | bc) s"
+
+            local n=0 first_ms=0 prompt_ms=0 out_ms=0 out_n=0
+            t0=$(date +%s.%N)
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              n=$((n + 1))
+              body=$(jq -n --arg s "$system" --arg u "$line" \
+                '{temperature: 0, max_tokens: 256,
+                  chat_template_kwargs: {enable_thinking: false},
+                  messages: [{role: "system", content: $s}, {role: "user", content: $u}]}')
+              out=$(curl -sS -m 300 http://127.0.0.1:8089/v1/chat/completions \
+                -H 'Content-Type: application/json' -d "$body")
+              p=$(jq -r '.timings.prompt_ms // 0 | floor' <<< "$out")
+              o=$(jq -r '.timings.predicted_ms // 0 | floor' <<< "$out")
+              k=$(jq -r '.timings.predicted_n // 0' <<< "$out")
+              if [ "$n" = 1 ]; then first_ms=$p; else prompt_ms=$((prompt_ms + p)); fi
+              out_ms=$((out_ms + o)); out_n=$((out_n + k))
+              echo "  [$name] $(jq -r '.choices[0].message.content // .error.message // "?"' <<< "$out")"
+            done < bench/lines.txt
+            local total; total=$(echo "$(date +%s.%N) - $t0" | bc)
+            echo "RESULT $name: $n lines in $total s | first prompt ${first_ms} ms | later prompts ${prompt_ms} ms | output ${out_ms} ms for ${out_n} tokens"
+            kill "$pid"; wait "$pid" 2> /dev/null || true
+          }
+
+          run_case threads-4 4 src/prompt.txt
+          run_case threads-3 3 src/prompt.txt
+          run_case threads-2 2 src/prompt.txt
+          run_case short-prompt 4 short-prompt.txt
+
+  # How small the binary gets under other optimisation levels.
+  size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install the static Linux target
+        run: |
+          rustup target add "$TARGET"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+
+      - name: Build with each optimisation level
+        run: |
+          set -euo pipefail
+          for level in s z 3; do
+            CARGO_PROFILE_RELEASE_OPT_LEVEL=$level \
+              cargo build --release --locked --target "$TARGET" --target-dir "target-$level" 2> /dev/null
+            size=$(stat -c %s "target-$level/$TARGET/release/horizon-news-bot")
+            echo "RESULT binary opt-level=$level: $size bytes"
+          done

@@ -10,13 +10,6 @@
 //! News is confirmed by construction: only items of releases Horizon has
 //! already published are posted, each with a link to its pull request.
 
-mod digest;
-mod github;
-mod parse;
-mod state;
-mod telegram;
-mod translate;
-
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -24,9 +17,10 @@ use std::time::Duration;
 
 use ureq::Agent;
 
-use crate::digest::Plan;
-use crate::state::State;
-use crate::translate::{LlamaServer, NoTranslator, Translator};
+use horizon_news_bot::digest::{self, Plan};
+use horizon_news_bot::state::State;
+use horizon_news_bot::translate::{self, LlamaServer, NoTranslator, Translator};
+use horizon_news_bot::{github, telegram};
 
 const DEFAULT_SOURCE_REPO: &str = "horizon-rust/horizon";
 const DEFAULT_STATE_PATH: &str = "state/state.json";
