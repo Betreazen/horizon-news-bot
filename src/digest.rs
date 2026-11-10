@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::github::Release;
-use crate::parse::{Item, clip, parse_body};
+use crate::parse::{Item, Section, clip, parse_body};
 use crate::state::State;
 
 /// Lines shown per section; the rest are summed up as "and N more".
@@ -105,23 +105,33 @@ pub fn plan(releases: &[Release], state: &State) -> Plan {
     // A release published before its notes were written has nothing to
     // parse yet. It is left unrecorded, so it is looked at again once the
     // notes appear.
-    let (launcher, game): (Vec<&Release>, Vec<&Release>) = to_post
+    let (launcher, game): (Vec<Parsed>, Vec<Parsed>) = to_post
         .into_iter()
-        .filter(|r| !parse_body(r.body.as_deref().unwrap_or_default()).is_empty())
-        .partition(|r| kind_of(r) == Kind::Launcher);
+        .map(|release| Parsed {
+            release,
+            sections: parse_body(release.body.as_deref().unwrap_or_default()),
+        })
+        .filter(|parsed| !parsed.sections.is_empty())
+        .partition(|parsed| kind_of(parsed.release) == Kind::Launcher);
     let groups = game
         .into_iter()
-        .map(|release| (Kind::Game, vec![release]))
+        .map(|parsed| (Kind::Game, vec![parsed]))
         .chain((!launcher.is_empty()).then_some((Kind::Launcher, launcher)));
 
     for (kind, group) in groups {
-        let keys: Vec<String> = group.iter().map(|r| release_key(r)).collect();
-        match build_block(kind, &group, &posted, &mut taken) {
+        let keys: Vec<String> = group.iter().map(|p| release_key(p.release)).collect();
+        match build_block(kind, group, &posted, &mut taken) {
             Some(block) => plan.blocks.push(block),
             None => plan.silent_releases.extend(keys),
         }
     }
     plan
+}
+
+/// A release with its notes parsed, so that they are parsed only once.
+struct Parsed<'a> {
+    release: &'a Release,
+    sections: Vec<Section>,
 }
 
 /// Published releases the bot has not handled, oldest first, one per key.
@@ -175,25 +185,22 @@ pub fn release_key(release: &Release) -> String {
 
 fn build_block(
     kind: Kind,
-    group: &[&Release],
+    group: Vec<Parsed>,
     posted: &HashSet<&str>,
     taken: &mut HashSet<String>,
 ) -> Option<Block> {
+    let releases: Vec<&Release> = group.iter().map(|parsed| parsed.release).collect();
     let mut merged: Vec<(String, Vec<Item>)> = Vec::new();
 
-    for release in group {
-        for section in parse_body(release.body.as_deref().unwrap_or_default()) {
-            let new_items: Vec<Item> = section
-                .items
-                .into_iter()
-                .filter(|item| {
-                    !posted.contains(item.key.as_str()) && taken.insert(item.key.clone())
-                })
-                .collect();
-            match merged.iter_mut().find(|(title, _)| *title == section.title) {
-                Some((_, items)) => items.extend(new_items),
-                None => merged.push((section.title, new_items)),
-            }
+    for section in group.into_iter().flat_map(|parsed| parsed.sections) {
+        let new_items: Vec<Item> = section
+            .items
+            .into_iter()
+            .filter(|item| !posted.contains(item.key.as_str()) && taken.insert(item.key.clone()))
+            .collect();
+        match merged.iter_mut().find(|(title, _)| *title == section.title) {
+            Some((_, items)) => items.extend(new_items),
+            None => merged.push((section.title, new_items)),
         }
     }
 
@@ -207,13 +214,13 @@ fn build_block(
         return None;
     }
 
-    let newest = group.last()?;
+    let newest = releases.last()?;
     Some(Block {
         kind,
-        label: label(kind, group),
+        label: label(kind, &releases),
         url: newest.url.clone(),
         sections,
-        release_keys: group.iter().map(|r| release_key(r)).collect(),
+        release_keys: releases.iter().map(|r| release_key(r)).collect(),
     })
 }
 
