@@ -1,0 +1,109 @@
+name: bench-models
+
+# One-off measurement: which open model translates Horizon changelog lines
+# well enough and fast enough on a GitHub runner.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/bench.yml", "bench/**", "src/prompt.txt"]
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_BUILD: b12110
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: translategemma-4b
+            repo: bullerwins/translategemma-4b-it-GGUF
+            file: translategemma-4b-it-Q4_K_M.gguf
+            mode: raw
+          - name: gemma-3-4b
+            repo: unsloth/gemma-3-4b-it-GGUF
+            file: gemma-3-4b-it-Q4_K_M.gguf
+            mode: chat
+          - name: gemma-4-e2b
+            repo: unsloth/gemma-4-E2B-it-GGUF
+            file: gemma-4-E2B-it-Q4_K_M.gguf
+            mode: chat
+          - name: gemma-4-e4b
+            repo: unsloth/gemma-4-E4B-it-GGUF
+            file: gemma-4-E4B-it-Q4_K_M.gguf
+            mode: chat
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Runner size
+        run: nproc && free -g | head -2 && df -h / | tail -1
+
+      - name: Download llama.cpp and the model
+        run: |
+          set -euo pipefail
+          t0=$(date +%s)
+          curl -sSfL -o llama.tar.gz \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_BUILD}/llama-${LLAMA_BUILD}-bin-ubuntu-x64.tar.gz"
+          mkdir llama && tar -xzf llama.tar.gz -C llama
+          find llama -name 'llama-server' -type f
+          curl -sSfL -o model.gguf \
+            "https://huggingface.co/${{ matrix.repo }}/resolve/main/${{ matrix.file }}"
+          ls -la model.gguf
+          echo "download took $(( $(date +%s) - t0 )) s"
+
+      - name: Start llama-server
+        run: |
+          set -euo pipefail
+          bin=$(find llama -name 'llama-server' -type f | head -1)
+          export LD_LIBRARY_PATH="$(dirname "$bin")"
+          t0=$(date +%s)
+          nohup "$bin" -m model.gguf -c 4096 -t "$(nproc)" --host 127.0.0.1 --port 8089 \
+            > server.log 2>&1 &
+          for i in $(seq 1 180); do
+            if curl -sf http://127.0.0.1:8089/health > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:8089/health
+          echo; echo "server ready after $(( $(date +%s) - t0 )) s"
+
+      - name: Translate the sample lines
+        run: |
+          set -euo pipefail
+          system=$(cat src/prompt.txt)
+          t0=$(date +%s)
+          n=0
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            n=$((n + 1))
+            if [ "${{ matrix.mode }}" = "raw" ]; then
+              prompt=$(printf '<start_of_turn>user\nYou are a professional English (en) to Russian (ru) translator. Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Russian grammar, vocabulary, and cultural sensitivities.\nProduce only the Russian translation, without any additional explanations or commentary. Please translate the following English text into Russian:\n\n\n%s<end_of_turn>\n<start_of_turn>model\n' "$line")
+              body=$(jq -n --arg p "$prompt" \
+                '{prompt: $p, temperature: 0, n_predict: 200, stop: ["<end_of_turn>"]}')
+              out=$(curl -sS -m 300 http://127.0.0.1:8089/completion \
+                -H 'Content-Type: application/json' -d "$body")
+              text=$(jq -r '.content // .error.message // "?"' <<< "$out")
+              speed=$(jq -r '.timings.predicted_per_second // 0' <<< "$out")
+            else
+              body=$(jq -n --arg s "$system" --arg u "$line" \
+                '{temperature: 0, max_tokens: 200,
+                  messages: [{role: "system", content: $s}, {role: "user", content: $u}]}')
+              out=$(curl -sS -m 300 http://127.0.0.1:8089/v1/chat/completions \
+                -H 'Content-Type: application/json' -d "$body")
+              text=$(jq -r '.choices[0].message.content // .error.message // "?"' <<< "$out")
+              speed=$(jq -r '.timings.predicted_per_second // 0' <<< "$out")
+              if [ "$n" = "1" ]; then echo "first raw reply: $(head -c 700 <<< "$out")"; fi
+            fi
+            printf 'EN: %s\nRU: %s\n    (%.1f tok/s)\n' "$line" "$text" "$speed"
+          done < bench/lines.txt
+          total=$(( $(date +%s) - t0 ))
+          echo "=== ${{ matrix.name }}: $n lines in $total s"
+
+      - name: Server log tail
+        if: always()
+        run: tail -n 40 server.log || true
