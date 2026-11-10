@@ -1,0 +1,90 @@
+name: news
+
+# Four times a day: look for new Horizon releases and post what changed.
+# A run with nothing new ends after the check, without loading the model.
+on:
+  schedule:
+    # 09:07, 13:07, 18:07 and 22:07 in Minsk (UTC+3). Off the hour on
+    # purpose: GitHub delays jobs scheduled at :00.
+    - cron: "7 6,10,15,19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: news
+  cancel-in-progress: false
+
+env:
+  # Both downloads are pinned to an exact build and checked by SHA-256.
+  LLAMA_BUILD: b12110
+  LLAMA_SHA256: 368227edcc229be5f9bed16a2223d79b5e41d0ac2e19bcf5825e82291c060e55
+  MODEL_REPO: unsloth/gemma-4-E4B-it-GGUF
+  MODEL_REVISION: bfc15c382204943c3a8fff0c750b94ae2364d7a3
+  MODEL_FILE: gemma-4-E4B-it-Q4_K_M.gguf
+  MODEL_SHA256: 85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87
+
+jobs:
+  news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the state branch
+        uses: actions/checkout@v4
+        with:
+          ref: state
+          path: state
+
+      - name: Download the bot
+        run: |
+          curl -sSfL -o bot \
+            "https://github.com/${{ github.repository }}/releases/download/bot/horizon-news-bot"
+          chmod +x bot
+
+      - name: Look for news
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          waiting=$(./bot check --state state/state.json)
+          echo "waiting=$waiting" >> "$GITHUB_OUTPUT"
+
+      - name: Download the translation model
+        if: steps.check.outputs.waiting != '0'
+        run: |
+          mkdir -p llm/llama
+          curl -sSfL -o llm/llama.tar.gz \
+            "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_BUILD}/llama-${LLAMA_BUILD}-bin-ubuntu-x64.tar.gz"
+          curl -sSfL -o llm/model.gguf \
+            "https://huggingface.co/${MODEL_REPO}/resolve/${MODEL_REVISION}/${MODEL_FILE}"
+          printf '%s  %s\n' "$LLAMA_SHA256" llm/llama.tar.gz "$MODEL_SHA256" llm/model.gguf | sha256sum --check
+          tar -xzf llm/llama.tar.gz -C llm/llama
+
+      - name: Post the news
+        if: steps.check.outputs.waiting != '0'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LLAMA_MODEL: llm/model.gguf
+        run: |
+          LLAMA_SERVER=$(find llm/llama -name llama-server -type f | head -n 1)
+          export LLAMA_SERVER
+          ./bot post --state state/state.json
+
+      - name: Show the model log
+        if: failure()
+        run: tail -n 40 "${TMPDIR:-/tmp}/llama-server.log" || true
+
+      - name: Save the state
+        if: always()
+        working-directory: state
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -q -m "state: $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push -q
+          fi

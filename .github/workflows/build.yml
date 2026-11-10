@@ -1,0 +1,55 @@
+name: build
+
+# Tests the bot and publishes its binary as the `bot` release, so the
+# scheduled news run downloads a ready program instead of compiling one.
+on:
+  push:
+    branches: [main]
+    paths: ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", ".github/workflows/build.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the static Linux target
+        run: |
+          rustup target add "$TARGET"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+
+      - name: Check
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+
+      - name: Build
+        run: |
+          cargo build --release --locked --target "$TARGET"
+          ls -la "target/$TARGET/release/horizon-news-bot"
+
+      - name: Publish the binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view bot > /dev/null 2>&1; then
+            gh release create bot --target "$GITHUB_SHA" --latest=false \
+              --title "Bot binary" \
+              --notes "The current build of the bot. The scheduled news run downloads it from here."
+          fi
+          gh release upload bot "target/$TARGET/release/horizon-news-bot" --clobber

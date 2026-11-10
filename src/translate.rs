@@ -1,0 +1,443 @@
+//! English changelog lines into Russian, through a local `llama-server`.
+//!
+//! A translation is used only when it passes [`accept`]; otherwise the line
+//! is posted in English as written. The model never sees links or pull
+//! request numbers, so it cannot change them.
+
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use ureq::Agent;
+
+use crate::digest::{Block, BlockSection, Line};
+
+const SYSTEM_PROMPT: &str = include_str!("prompt.txt");
+const PORT: u16 = 8089;
+const CONTEXT_TOKENS: &str = "4096";
+const MAX_REPLY_TOKENS: u32 = 256;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// A translation much longer than its source is the model rambling.
+const MAX_LENGTH_RATIO: usize = 3;
+const LENGTH_SLACK: usize = 40;
+const MIN_DOTTED_PART: usize = 2;
+
+pub trait Translator {
+    /// Russian for one line, or `None` when no trustworthy translation came back.
+    fn translate(&mut self, line: &str) -> Option<String>;
+}
+
+/// Posts lines as written. Used when no model is configured.
+pub struct NoTranslator;
+
+impl Translator for NoTranslator {
+    fn translate(&mut self, _line: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Replaces every line of a block with its Russian translation where one
+/// was accepted.
+pub fn translate_block(block: Block, translator: &mut dyn Translator) -> Block {
+    let sections = block
+        .sections
+        .into_iter()
+        .map(|section| BlockSection {
+            lines: section
+                .lines
+                .into_iter()
+                .map(|line| Line {
+                    text: translator.translate(&line.text).unwrap_or(line.text),
+                    ..line
+                })
+                .collect(),
+            ..section
+        })
+        .collect();
+    Block { sections, ..block }
+}
+
+/// A `llama-server` child process, stopped when dropped.
+pub struct LlamaServer {
+    child: Child,
+    agent: Agent,
+    url: String,
+}
+
+impl LlamaServer {
+    /// Starts the server and waits until the model is loaded.
+    pub fn start(binary: &Path, model: &Path, agent: Agent) -> Result<Self, String> {
+        let log_path = log_path();
+        let log = File::create(&log_path)
+            .map_err(|e| format!("cannot create {}: {e}", log_path.display()))?;
+        let log_copy = log
+            .try_clone()
+            .map_err(|e| format!("cannot open {}: {e}", log_path.display()))?;
+        let threads = std::thread::available_parallelism().map_or(2, usize::from);
+
+        let mut command = Command::new(binary);
+        command
+            .arg("-m")
+            .arg(model)
+            .args(["-c", CONTEXT_TOKENS, "--host", "127.0.0.1"])
+            .args(["--port", &PORT.to_string(), "-t", &threads.to_string()])
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(log_copy);
+        // The release archive ships its shared libraries next to the binary.
+        if let Some(dir) = binary.parent() {
+            command.env("LD_LIBRARY_PATH", dir);
+        }
+        let child = command
+            .spawn()
+            .map_err(|e| format!("cannot start {}: {e}", binary.display()))?;
+
+        let mut server = Self {
+            child,
+            agent,
+            url: format!("http://127.0.0.1:{PORT}"),
+        };
+        server.wait_until_ready(&log_path)?;
+        Ok(server)
+    }
+
+    fn wait_until_ready(&mut self, log_path: &Path) -> Result<(), String> {
+        let started = Instant::now();
+        let health = format!("{}/health", self.url);
+        while started.elapsed() < STARTUP_TIMEOUT {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(format!(
+                    "llama-server exited early ({status}); see {}",
+                    log_path.display()
+                ));
+            }
+            let ready = self
+                .agent
+                .get(&health)
+                .call()
+                .is_ok_and(|response| response.status().as_u16() == 200);
+            if ready {
+                eprintln!("llama-server ready after {} s", started.elapsed().as_secs());
+                return Ok(());
+            }
+            sleep(POLL_INTERVAL);
+        }
+        Err(format!(
+            "llama-server did not load the model in {} s; see {}",
+            STARTUP_TIMEOUT.as_secs(),
+            log_path.display()
+        ))
+    }
+
+    fn ask(&self, line: &str) -> Result<String, String> {
+        let body = json!({
+            "temperature": 0,
+            "max_tokens": MAX_REPLY_TOKENS,
+            // Gemma 4 otherwise spends its reply budget thinking aloud.
+            // Measured on a runner: the server flag `--reasoning-budget 0`
+            // does not stop it, this template switch does.
+            "chat_template_kwargs": { "enable_thinking": false },
+            "messages": [
+                { "role": "system", "content": SYSTEM_PROMPT },
+                { "role": "user", "content": line },
+            ],
+        });
+        let mut response = self
+            .agent
+            .post(format!("{}/v1/chat/completions", self.url))
+            .send_json(&body)
+            .map_err(|e| format!("llama-server request failed: {e}"))?;
+        let status = response.status().as_u16();
+        let reply: Value = response
+            .body_mut()
+            .read_json()
+            .map_err(|e| format!("llama-server sent an unreadable reply: {e}"))?;
+        if status != 200 {
+            return Err(format!("llama-server answered HTTP {status}: {reply}"));
+        }
+        reply["choices"][0]["message"]["content"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("llama-server reply has no text: {reply}"))
+    }
+}
+
+impl Translator for LlamaServer {
+    fn translate(&mut self, line: &str) -> Option<String> {
+        match self.ask(line) {
+            Ok(reply) => {
+                let accepted = accept(line, &reply);
+                if accepted.is_none() {
+                    eprintln!("translation rejected, posting the original: {line:?} -> {reply:?}");
+                }
+                accepted
+            }
+            Err(error) => {
+                eprintln!("{error}; posting the original: {line:?}");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for LlamaServer {
+    fn drop(&mut self) {
+        // The process may already be gone; there is nothing useful to do then.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub fn log_path() -> PathBuf {
+    std::env::temp_dir().join("llama-server.log")
+}
+
+/// Checks a model reply against its source line and returns the cleaned
+/// translation, or `None` when the reply cannot be trusted:
+/// it must be Russian, of a sane length, and carry exactly the numbers and
+/// code identifiers of the source.
+pub fn accept(source: &str, reply: &str) -> Option<String> {
+    let line = reply.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = unwrap_quotes(line, source);
+
+    let is_russian = line
+        .chars()
+        .any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'));
+    let length_limit = source.chars().count() * MAX_LENGTH_RATIO + LENGTH_SLACK;
+    let sane_length = line.chars().count() <= length_limit;
+    let same_numbers = numbers(source) == numbers(line);
+    let keeps_code = code_tokens(source).all(|token| line.contains(token));
+
+    (is_russian && sane_length && same_numbers && keeps_code).then(|| line.to_string())
+}
+
+/// Models like to wrap an answer in quotes the source never had.
+fn unwrap_quotes<'a>(line: &'a str, source: &str) -> &'a str {
+    const PAIRS: [(char, char); 3] = [('"', '"'), ('«', '»'), ('“', '”')];
+    for (open, close) in PAIRS {
+        let wrapped = line.starts_with(open) && line.ends_with(close) && line.chars().count() > 1;
+        if wrapped && !source.starts_with(open) {
+            return line[open.len_utf8()..line.len() - close.len_utf8()].trim();
+        }
+    }
+    line
+}
+
+/// Every run of digits, sorted, so word order may change but values may not.
+fn numbers(text: &str) -> Vec<&str> {
+    let mut runs: Vec<&str> = text
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|run| !run.is_empty())
+        .collect();
+    runs.sort_unstable();
+    runs
+}
+
+/// Words that are code rather than prose: `snake_case`, `dotted.names` and
+/// `camelCase`. They must survive translation letter for letter.
+fn code_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .filter(|word| word.is_ascii() && !word.contains('\''))
+        .filter(|word| is_code(word))
+}
+
+fn is_code(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let snake = bytes
+        .windows(3)
+        .any(|w| w[1] == b'_' && w[0].is_ascii_alphanumeric() && w[2].is_ascii_alphanumeric());
+    // Parts of two letters or more, so "e.g" and version numbers are not code.
+    let dotted = word.contains('.') && word.split('.').all(|part| part.len() >= MIN_DOTTED_PART);
+    let camel = bytes
+        .windows(2)
+        .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase());
+    snake || dotted || camel
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::digest::Kind;
+
+    #[test]
+    fn a_plain_russian_translation_is_accepted() {
+        let result = accept(
+            "Crowded mobs take cramming damage, as vanilla",
+            "Мобы в толпе получают урон от давки, как в ванильной игре",
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("Мобы в толпе получают урон от давки, как в ванильной игре")
+        );
+    }
+
+    #[test]
+    fn only_the_first_line_of_a_reply_is_used() {
+        let result = accept(
+            "Boats stop",
+            "\n  Лодки останавливаются  \n\nПримечание: перевод дословный.",
+        );
+        assert_eq!(result.as_deref(), Some("Лодки останавливаются"));
+    }
+
+    #[test]
+    fn wrapping_quotes_are_removed() {
+        assert_eq!(
+            accept("Boats stop", "«Лодки останавливаются»").as_deref(),
+            Some("Лодки останавливаются")
+        );
+        assert_eq!(
+            accept("Boats stop", "\"Лодки останавливаются\"").as_deref(),
+            Some("Лодки останавливаются")
+        );
+    }
+
+    #[test]
+    fn an_untranslated_reply_is_rejected() {
+        assert_eq!(accept("Boats stop", "Boats stop"), None);
+        assert_eq!(accept("Boats stop", "   "), None);
+    }
+
+    #[test]
+    fn a_changed_number_is_rejected() {
+        let source = "Signs: keep laid-out sign text between frames (3458 signs: 124 → 222 fps)";
+        assert_eq!(
+            accept(
+                source,
+                "Таблички: текст сохраняется между кадрами (3458 табличек: 124 → 232 кадр/с)"
+            ),
+            None
+        );
+        assert!(
+            accept(
+                source,
+                "Таблички: текст сохраняется между кадрами (3458 табличек: 124 → 222 кадр/с)"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn a_dropped_or_invented_number_is_rejected() {
+        assert_eq!(
+            accept(
+                "Launcher: the 155 strings Kazakh still shows in English",
+                "Лаунчер: строки на казахском"
+            ),
+            None
+        );
+        assert_eq!(
+            accept("Boats stop", "Лодки останавливаются через 5 секунд"),
+            None
+        );
+    }
+
+    #[test]
+    fn numbers_may_change_order() {
+        assert!(accept("From 124 to 222 fps", "До 222 кадр/с вместо 124").is_some());
+    }
+
+    #[test]
+    fn code_identifiers_must_survive_unchanged() {
+        let source = "F1 hides the HUD only with no screen open, as key.toggleGui does";
+        assert!(
+            accept(
+                source,
+                "F1 скрывает интерфейс только без открытого экрана, как key.toggleGui"
+            )
+            .is_some()
+        );
+        assert_eq!(
+            accept(
+                source,
+                "F1 скрывает интерфейс только без открытого экрана, как клавиша переключения"
+            ),
+            None
+        );
+
+        let hook = "Native mods: a cancellable toast_add hook (ToastAddEvent)";
+        assert!(
+            accept(
+                hook,
+                "Нативные моды: отменяемый хук toast_add (ToastAddEvent)"
+            )
+            .is_some()
+        );
+        assert_eq!(
+            accept(
+                hook,
+                "Нативные моды: отменяемый хук добавления уведомления (ToastAddEvent)"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ordinary_words_are_not_code() {
+        let tokens: Vec<&str> = code_tokens(
+            "Villagers stand beside the bed where vanilla's area ends. Mods' fluids flow, e.g. now",
+        )
+        .collect();
+        assert!(tokens.is_empty(), "{tokens:?}");
+    }
+
+    #[test]
+    fn a_rambling_reply_is_rejected() {
+        let reply = "Лодки ".repeat(40);
+        assert_eq!(accept("Boats stop", &reply), None);
+    }
+
+    struct Upper;
+    impl Translator for Upper {
+        fn translate(&mut self, line: &str) -> Option<String> {
+            (line != "keep").then(|| line.to_uppercase())
+        }
+    }
+
+    #[test]
+    fn a_block_keeps_the_original_where_translation_fails() {
+        let block = Block {
+            kind: Kind::Game,
+            label: "Nightly".to_string(),
+            url: "https://example.test".to_string(),
+            sections: vec![BlockSection {
+                title: "Fixed".to_string(),
+                lines: vec![
+                    Line {
+                        text: "one".to_string(),
+                        pr: Some(7),
+                        similar: 2,
+                    },
+                    Line {
+                        text: "keep".to_string(),
+                        pr: None,
+                        similar: 0,
+                    },
+                ],
+                hidden: 3,
+            }],
+            release_keys: vec!["Nightly".to_string()],
+            item_keys: vec!["#7".to_string()],
+        };
+
+        let translated = translate_block(block.clone(), &mut Upper);
+        let lines = &translated.sections[0].lines;
+
+        assert_eq!(
+            lines[0],
+            Line {
+                text: "ONE".to_string(),
+                pr: Some(7),
+                similar: 2
+            }
+        );
+        assert_eq!(lines[1].text, "keep");
+        assert_eq!(translated.sections[0].hidden, 3);
+        assert_eq!(translated.item_keys, block.item_keys);
+    }
+}
