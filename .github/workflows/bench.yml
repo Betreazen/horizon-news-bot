@@ -4,6 +4,12 @@ name: bench
 # Telegram or touches the state. Results are logged in docs/perf-log.md.
 on:
   workflow_dispatch:
+    inputs:
+      what:
+        description: Which measurement to run
+        type: choice
+        default: download
+        options: [download, translate, size]
 
 permissions:
   contents: read
@@ -14,8 +20,35 @@ env:
   MODEL_SHA256: 85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87
 
 jobs:
-  # Where a news run spends its time: getting the model, and translating.
-  model:
+  # Hugging Face's speed swings from minute to minute, so the two ways of
+  # fetching the model take turns, and each round starts with the other.
+  download:
+    if: inputs.what == 'download'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: One stream against four, three rounds
+        run: |
+          set -euo pipefail
+          one_stream() {
+            local t0; t0=$(date +%s.%N)
+            curl -sSfL -o model.gguf "$MODEL_URL"
+            echo "RESULT round $1 curl: $(echo "$(date +%s.%N) - $t0" | bc) s"
+            rm model.gguf
+          }
+          four_streams() {
+            local t0; t0=$(date +%s.%N)
+            aria2c -q -x 4 -s 4 -k 16M --file-allocation=none -o model.gguf "$MODEL_URL"
+            echo "RESULT round $1 aria2c x4: $(echo "$(date +%s.%N) - $t0" | bc) s"
+            rm model.gguf
+          }
+          one_stream 1;   four_streams 1
+          four_streams 2; one_stream 2
+          one_stream 3;   four_streams 3
+
+  # Where a news run spends its time once the model is there.
+  translate:
+    if: inputs.what == 'translate'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -23,20 +56,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download, one stream against several
+      - name: Download the model
         run: |
-          set -euo pipefail
           nproc; free -g | sed -n 2p
-          t0=$(date +%s.%N)
-          curl -sSfL -o model.gguf "$MODEL_URL"
-          echo "RESULT download curl: $(echo "$(date +%s.%N) - $t0" | bc) s"
-          rm model.gguf
-          for streams in 4 8 16; do
-            t0=$(date +%s.%N)
-            aria2c -q -x "$streams" -s "$streams" -k 16M --file-allocation=none -o model.gguf "$MODEL_URL"
-            echo "RESULT download aria2c x$streams: $(echo "$(date +%s.%N) - $t0" | bc) s"
-            [ "$streams" = 16 ] || rm model.gguf
-          done
+          aria2c -q -x 4 -s 4 -k 16M --file-allocation=none -o model.gguf "$MODEL_URL"
 
       - name: Checksum and unpack
         run: |
@@ -101,6 +124,7 @@ jobs:
 
   # How small the binary gets under other optimisation levels.
   size:
+    if: inputs.what == 'size'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
