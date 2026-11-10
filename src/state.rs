@@ -1,6 +1,7 @@
 //! What the bot remembers between runs: which releases and changelog items
 //! it has already posted.
 
+use std::collections::HashSet;
 use std::{fs, io, path::Path};
 
 use serde::{Deserialize, Serialize};
@@ -63,11 +64,21 @@ fn appended(
     extra: impl IntoIterator<Item = String>,
     cap: usize,
 ) -> Vec<String> {
-    for key in extra {
-        if !list.contains(&key) {
-            list.push(key);
-        }
+    let extra: Vec<String> = extra.into_iter().collect();
+    if extra.is_empty() {
+        return list;
     }
+    // One set of what is already stored, instead of a scan of the whole
+    // list for every new key. `insert` also weeds out repeats in `extra`.
+    let fresh: Vec<String> = {
+        let mut known: HashSet<&str> = list.iter().map(String::as_str).collect();
+        extra
+            .iter()
+            .filter(|key| known.insert(key.as_str()))
+            .cloned()
+            .collect()
+    };
+    list.extend(fresh);
     let overflow = list.len().saturating_sub(cap);
     list.drain(..overflow);
     list
