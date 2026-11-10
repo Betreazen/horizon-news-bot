@@ -83,13 +83,20 @@ pub struct Plan {
 
 pub fn plan(releases: &[Release], state: &State) -> Plan {
     let fresh = fresh_releases(releases, state);
+    if fresh.is_empty() {
+        // The usual run: nothing to look at, so nothing more is built.
+        return Plan::default();
+    }
     let (to_post, to_skip) = if state.initialized {
         (fresh, Vec::new())
     } else {
         first_run_split(fresh)
     };
 
-    let mut seen_items: HashSet<String> = state.seen_items.iter().cloned().collect();
+    // What was posted before is only looked up, so it is borrowed from the
+    // state; only the keys taken during this plan are owned.
+    let posted: HashSet<&str> = state.seen_items.iter().map(String::as_str).collect();
+    let mut taken: HashSet<String> = HashSet::new();
     let mut plan = Plan {
         blocks: Vec::new(),
         silent_releases: to_skip.iter().map(|r| release_key(r)).collect(),
@@ -109,7 +116,7 @@ pub fn plan(releases: &[Release], state: &State) -> Plan {
 
     for (kind, group) in groups {
         let keys: Vec<String> = group.iter().map(|r| release_key(r)).collect();
-        match build_block(kind, &group, &mut seen_items) {
+        match build_block(kind, &group, &posted, &mut taken) {
             Some(block) => plan.blocks.push(block),
             None => plan.silent_releases.extend(keys),
         }
@@ -124,8 +131,10 @@ fn fresh_releases<'a>(releases: &'a [Release], state: &State) -> Vec<&'a Release
     let mut fresh: Vec<&Release> = releases
         .iter()
         .filter(|r| !r.draft)
-        .filter(|r| !seen.contains(release_key(r).as_str()))
-        .filter(|r| taken.insert(release_key(r)))
+        .filter(|r| {
+            let key = release_key(r);
+            !seen.contains(key.as_str()) && taken.insert(key)
+        })
         .collect();
     fresh.sort_by(|a, b| a.published_at.cmp(&b.published_at));
     fresh
@@ -164,7 +173,12 @@ pub fn release_key(release: &Release) -> String {
     }
 }
 
-fn build_block(kind: Kind, group: &[&Release], seen_items: &mut HashSet<String>) -> Option<Block> {
+fn build_block(
+    kind: Kind,
+    group: &[&Release],
+    posted: &HashSet<&str>,
+    taken: &mut HashSet<String>,
+) -> Option<Block> {
     let mut merged: Vec<(String, Vec<Item>)> = Vec::new();
 
     for release in group {
@@ -172,7 +186,9 @@ fn build_block(kind: Kind, group: &[&Release], seen_items: &mut HashSet<String>)
             let new_items: Vec<Item> = section
                 .items
                 .into_iter()
-                .filter(|item| seen_items.insert(item.key.clone()))
+                .filter(|item| {
+                    !posted.contains(item.key.as_str()) && taken.insert(item.key.clone())
+                })
                 .collect();
             match merged.iter_mut().find(|(title, _)| *title == section.title) {
                 Some((_, items)) => items.extend(new_items),
