@@ -1,7 +1,7 @@
 {
   "initialized": true,
-  "etag_list": "\"1142aec41f1f023495c9dd91e163a2501334b7106725bb6f192c06e4ccd77200\"",
-  "etag_nightly": "\"d9004e762660779af8095432743b5114bfa4cfe38a3b2bcf53d70c04e51090df\"",
+  "etag_list": null,
+  "etag_nightly": null,
   "seen_releases": [
     "Horizon launcher 0.2.34",
     "Horizon launcher 0.2.35",
@@ -31,7 +31,6 @@
     "Horizon launcher 0.2.55",
     "Horizon launcher 0.2.56",
     "Horizon launcher 0.2.57",
-    "Horizon launcher 0.2.58",
     "Nightly 2026-11-08 · fdc87ae"
   ],
   "seen_items": [
