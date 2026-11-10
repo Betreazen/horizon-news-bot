@@ -574,32 +574,30 @@ mod tests {
                         text: "one".to_string(),
                         pr: Some(7),
                         similar: 2,
+                        keys: vec!["#7".to_string(), "#8".to_string(), "#9".to_string()],
                     },
                     Line {
                         text: "keep".to_string(),
                         pr: None,
                         similar: 0,
+                        keys: vec!["t:1".to_string()],
                     },
                 ],
                 hidden: 3,
+                hidden_keys: vec!["#10".to_string()],
             }],
             release_keys: vec!["Nightly".to_string()],
-            item_keys: vec!["#7".to_string()],
         };
 
         let translated = translate_block(block.clone(), &mut Upper);
         let lines = &translated.sections[0].lines;
 
-        assert_eq!(
-            lines[0],
-            Line {
-                text: "ONE".to_string(),
-                pr: Some(7),
-                similar: 2
-            }
-        );
+        assert_eq!(lines[0].text, "ONE");
         assert_eq!(lines[1].text, "keep");
+        // Only the text changes: links, counts and keys stay as they were.
+        assert_eq!((lines[0].pr, lines[0].similar), (Some(7), 2));
         assert_eq!(translated.sections[0].hidden, 3);
-        assert_eq!(translated.item_keys, block.item_keys);
+        assert_eq!(translated.item_keys(), block.item_keys());
+        assert_eq!(translated.release_keys, block.release_keys);
     }
 }

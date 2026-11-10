@@ -32,6 +32,8 @@ jobs:
     permissions:
       # Only the last step uses this, to push the state file.
       contents: write
+      # To check where the bot binary came from.
+      attestations: read
     steps:
       - name: Check out the state branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -46,6 +48,17 @@ jobs:
         run: |
           curl -sSfL -o bot \
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/bot/horizon-news-bot"
+
+      # The binary runs with the bot token in its environment, so it must
+      # be the one build.yml produced from main, not merely a file that
+      # sits in the release.
+      - name: Verify the bot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify bot --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build.yml" \
+            --source-ref refs/heads/main
           chmod +x bot
 
       - name: Look for news

@@ -33,6 +33,8 @@ pub struct Line {
     pub pr: Option<u32>,
     /// Look-alike lines folded into this one.
     pub similar: usize,
+    /// Keys of the change this line shows and of those folded into it.
+    pub keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,8 +42,9 @@ pub struct BlockSection {
     /// Heading as written in the release.
     pub title: String,
     pub lines: Vec<Line>,
-    /// Changes left out by the per-section cap.
+    /// Changes left out by the caps, and their keys.
     pub hidden: usize,
+    pub hidden_keys: Vec<String>,
 }
 
 /// One Telegram post: a game release, or all new launcher releases together.
@@ -53,7 +56,21 @@ pub struct Block {
     pub url: String,
     pub sections: Vec<BlockSection>,
     pub release_keys: Vec<String>,
-    pub item_keys: Vec<String>,
+}
+
+impl Block {
+    /// Keys of every change the block covers, shown or hidden.
+    #[cfg(test)]
+    pub fn item_keys(&self) -> Vec<&str> {
+        self.sections
+            .iter()
+            .flat_map(|section| {
+                let shown = section.lines.iter().flat_map(|line| &line.keys);
+                shown.chain(&section.hidden_keys)
+            })
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -149,7 +166,6 @@ pub fn release_key(release: &Release) -> String {
 
 fn build_block(kind: Kind, group: &[&Release], seen_items: &mut HashSet<String>) -> Option<Block> {
     let mut merged: Vec<(String, Vec<Item>)> = Vec::new();
-    let mut item_keys = Vec::new();
 
     for release in group {
         for section in parse_body(release.body.as_deref().unwrap_or_default()) {
@@ -158,7 +174,6 @@ fn build_block(kind: Kind, group: &[&Release], seen_items: &mut HashSet<String>)
                 .into_iter()
                 .filter(|item| seen_items.insert(item.key.clone()))
                 .collect();
-            item_keys.extend(new_items.iter().map(|item| item.key.clone()));
             match merged.iter_mut().find(|(title, _)| *title == section.title) {
                 Some((_, items)) => items.extend(new_items),
                 None => merged.push((section.title, new_items)),
@@ -183,23 +198,30 @@ fn build_block(kind: Kind, group: &[&Release], seen_items: &mut HashSet<String>)
         url: newest.url.clone(),
         sections,
         release_keys: group.iter().map(|r| release_key(r)).collect(),
-        item_keys,
     })
 }
 
 /// Keeps the first sections and counts the changes of the rest as hidden
 /// in the last one kept, so the post still says how much it left out.
-fn within_section_cap(sections: Vec<BlockSection>) -> Vec<BlockSection> {
-    let overflow: usize = sections
-        .iter()
-        .skip(MAX_SECTIONS_PER_BLOCK)
-        .map(|section| section.hidden + section.lines.iter().map(|l| 1 + l.similar).sum::<usize>())
-        .sum();
-    let mut kept: Vec<BlockSection> = sections.into_iter().take(MAX_SECTIONS_PER_BLOCK).collect();
-    if let Some(last) = kept.last_mut() {
-        last.hidden += overflow;
+fn within_section_cap(mut sections: Vec<BlockSection>) -> Vec<BlockSection> {
+    let cut = sections.len().min(MAX_SECTIONS_PER_BLOCK);
+    let dropped = sections.split_off(cut);
+    if let Some(last) = sections.last_mut() {
+        for section in dropped {
+            last.hidden += section.hidden + count_changes(&section.lines);
+            last.hidden_keys.extend(keys_of(section.lines));
+            last.hidden_keys.extend(section.hidden_keys);
+        }
     }
-    kept
+    sections
+}
+
+fn count_changes(lines: &[Line]) -> usize {
+    lines.iter().map(|line| 1 + line.similar).sum()
+}
+
+fn keys_of(lines: Vec<Line>) -> impl Iterator<Item = String> {
+    lines.into_iter().flat_map(|line| line.keys)
 }
 
 fn label(kind: Kind, group: &[&Release]) -> String {
@@ -221,23 +243,33 @@ fn label(kind: Kind, group: &[&Release]) -> String {
 /// languages) into the first of them.
 fn collapse(items: Vec<Item>) -> Vec<Line> {
     let shapes: Vec<String> = items.iter().map(|item| shape(&item.text)).collect();
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for shape in &shapes {
-        *counts.entry(shape.as_str()).or_default() += 1;
+    let mut groups: HashMap<&str, Vec<String>> = HashMap::new();
+    for (item, shape) in items.iter().zip(&shapes) {
+        groups
+            .entry(shape.as_str())
+            .or_default()
+            .push(item.key.clone());
     }
 
-    let mut emitted: HashSet<&str> = HashSet::new();
     let mut lines = Vec::new();
     for (item, shape) in items.iter().zip(&shapes) {
-        let count = counts[shape.as_str()];
-        let folded = count >= MIN_GROUP_TO_COLLAPSE;
-        if folded && !emitted.insert(shape.as_str()) {
+        let folded = groups
+            .get(shape.as_str())
+            .is_some_and(|keys| keys.len() >= MIN_GROUP_TO_COLLAPSE);
+        let keys = if folded {
+            // The first line of a group takes the whole group; the map
+            // entry is gone for the lines that follow, which are skipped.
+            groups.remove(shape.as_str()).unwrap_or_default()
+        } else if groups.contains_key(shape.as_str()) {
+            vec![item.key.clone()]
+        } else {
             continue;
-        }
+        };
         lines.push(Line {
             text: item.text.clone(),
             pr: item.pr,
-            similar: if folded { count - 1 } else { 0 },
+            similar: keys.len() - 1,
+            keys,
         });
     }
     lines
@@ -264,16 +296,14 @@ fn shape(text: &str) -> String {
     format!("{} … {}", head.join(" "), tail.join(" "))
 }
 
-fn capped(title: String, lines: Vec<Line>) -> BlockSection {
-    let hidden = lines
-        .iter()
-        .skip(MAX_LINES_PER_SECTION)
-        .map(|line| 1 + line.similar)
-        .sum();
+fn capped(title: String, mut lines: Vec<Line>) -> BlockSection {
+    let cut = lines.len().min(MAX_LINES_PER_SECTION);
+    let dropped = lines.split_off(cut);
     BlockSection {
         title,
-        lines: lines.into_iter().take(MAX_LINES_PER_SECTION).collect(),
-        hidden,
+        lines,
+        hidden: count_changes(&dropped),
+        hidden_keys: keys_of(dropped).collect(),
     }
 }
 
@@ -329,7 +359,10 @@ mod tests {
         let block = &first.blocks[0];
         let state = State::default()
             .with_seen(first.silent_releases.clone(), [])
-            .with_seen(block.release_keys.clone(), block.item_keys.clone());
+            .with_seen(
+                block.release_keys.clone(),
+                block.item_keys().into_iter().map(String::from),
+            );
 
         assert_eq!(plan(&releases, &state), Plan::default());
     }
@@ -434,7 +467,83 @@ mod tests {
         let state = running().with_seen([], ["#1".to_string()]);
         let plan = plan(&releases, &state);
         assert_eq!(texts(&plan.blocks[0].sections[0]), ["Fresh"]);
-        assert_eq!(plan.blocks[0].item_keys, ["#2"]);
+        assert_eq!(plan.blocks[0].item_keys(), ["#2"]);
+    }
+
+    #[test]
+    fn a_post_cut_off_halfway_is_continued_not_started_over() {
+        let releases = [release(
+            "nightly",
+            "Nightly A",
+            "2026-11-09T11:00:00Z",
+            "### New\n- First (#1)\n- Second (#2)\n### Fixed\n- Third (#3)\n- Fourth (#4)",
+        )];
+        // The first message carried #1, #2 and #3, then the run died: the
+        // items are recorded, the release is not.
+        let delivered = ["#1", "#2", "#3"].map(String::from);
+        let state = running().with_seen([], delivered);
+
+        let plan = plan(&releases, &state);
+
+        assert_eq!(plan.blocks.len(), 1);
+        assert_eq!(plan.blocks[0].sections.len(), 1);
+        assert_eq!(texts(&plan.blocks[0].sections[0]), ["Fourth"]);
+        assert_eq!(plan.blocks[0].release_keys, ["Nightly A"]);
+    }
+
+    #[test]
+    fn a_folded_line_carries_the_keys_of_everything_folded_into_it() {
+        let body = "### New\n\
+            - Launcher: the 155 strings Kazakh still shows in English (#1)\n\
+            - Launcher: the 84 strings Latin still shows in English (#2)\n\
+            - Something else entirely (#3)\n\
+            - Launcher: the 7 strings West Frisian still shows in English (#4)";
+        let releases = [release(
+            "nightly",
+            "Nightly A",
+            "2026-11-09T11:00:00Z",
+            body,
+        )];
+        let plan = plan(&releases, &running());
+        let lines = &plan.blocks[0].sections[0].lines;
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            (lines[0].similar, &lines[0].keys[..]),
+            (
+                2,
+                &["#1".to_string(), "#2".to_string(), "#4".to_string()][..]
+            )
+        );
+        assert_eq!(
+            (lines[1].similar, &lines[1].keys[..]),
+            (0, &["#3".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn changes_hidden_by_the_cap_keep_their_keys() {
+        const SUBJECTS: [&str; 14] = [
+            "Boats", "Signs", "Portals", "Chunks", "Mobs", "Maps", "Beds", "Books", "Doors",
+            "Rails", "Crops", "Torches", "Chests", "Anvils",
+        ];
+        let body: String = SUBJECTS
+            .iter()
+            .zip(1..)
+            .fold("### Fixed\n".to_string(), |body, (subject, n)| {
+                format!("{body}- {subject} behave as vanilla (#{n})\n")
+            });
+        let releases = [release(
+            "nightly",
+            "Nightly A",
+            "2026-11-09T11:00:00Z",
+            &body,
+        )];
+        let plan = plan(&releases, &running());
+        let section = &plan.blocks[0].sections[0];
+
+        assert_eq!(section.hidden, 2);
+        assert_eq!(section.hidden_keys, ["#13", "#14"]);
     }
 
     #[test]
@@ -526,7 +635,7 @@ mod tests {
 
         assert_eq!(block.sections.len(), MAX_SECTIONS_PER_BLOCK);
         assert_eq!(block.sections.last().unwrap().hidden, 2);
-        assert_eq!(block.item_keys.len(), MAX_SECTIONS_PER_BLOCK + 2);
+        assert_eq!(block.item_keys().len(), MAX_SECTIONS_PER_BLOCK + 2);
     }
 
     #[test]
@@ -560,7 +669,7 @@ mod tests {
             "three real changes plus the folded line"
         );
         // Every folded change is still recorded, so none is posted later.
-        assert!(plan.blocks[0].item_keys.len() > new.lines.len() + folded[0].similar - 1);
+        assert!(plan.blocks[0].item_keys().len() > new.lines.len() + folded[0].similar - 1);
     }
 
     #[test]
@@ -616,6 +725,6 @@ mod tests {
 
         assert_eq!(section.lines.len(), MAX_LINES_PER_SECTION);
         assert_eq!(section.hidden, 20 - MAX_LINES_PER_SECTION);
-        assert_eq!(plan.blocks[0].item_keys.len(), 20);
+        assert_eq!(plan.blocks[0].item_keys().len(), 20);
     }
 }

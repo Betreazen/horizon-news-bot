@@ -115,8 +115,12 @@ fn settle(args: &Args, state: State, silent: Vec<String>) -> Result<(), String> 
     save(args, &next)
 }
 
-/// Sends the waiting posts in order. A post counts as done only after
-/// Telegram accepted it, so a failure leaves the rest for the next run.
+/// Sends the waiting posts in order.
+///
+/// The changes a message reports are recorded and saved as soon as
+/// Telegram accepts that message. A run that fails or is killed halfway
+/// therefore leaves exactly the unsent changes for the next run, which
+/// continues the post instead of starting it over.
 fn post(args: &Args, agent: &Agent, state: State, plan: Plan) -> Result<(), String> {
     let credentials = if args.dry_run {
         None
@@ -127,26 +131,28 @@ fn post(args: &Args, agent: &Agent, state: State, plan: Plan) -> Result<(), Stri
     let mut next = state.with_seen(plan.silent_releases, []);
     let mut failure = None;
 
-    for block in plan.blocks {
+    'blocks: for block in plan.blocks {
         let block = translate::translate_block(block, translator.as_mut());
-        let sent = match &credentials {
-            Some(c) => telegram::send_block(agent, &c.token, &c.chat_id, &block),
-            None => {
-                println!("{}\n", telegram::render(&block));
-                Ok(())
+        for part in telegram::parts(&block, telegram::MESSAGE_LIMIT) {
+            let sent = match &credentials {
+                Some(c) => telegram::send(agent, &c.token, &c.chat_id, &part.text),
+                None => {
+                    println!("{}\n", part.text);
+                    Ok(())
+                }
+            };
+            let recorded = sent.and_then(|()| {
+                next = std::mem::take(&mut next).with_seen([], part.item_keys);
+                save(args, &next)
+            });
+            if let Err(error) = recorded {
+                failure = Some(error);
+                break 'blocks;
             }
-        };
-        // Saved after every post: if the run is killed later, what was
-        // already sent is not sent again.
-        let recorded = sent.and_then(|()| {
-            eprintln!("posted: {:?}", block.label);
-            next = next.clone().with_seen(block.release_keys, block.item_keys);
-            save(args, &next)
-        });
-        if let Err(error) = recorded {
-            failure = Some(error);
-            break;
         }
+        // The release itself is done only when its last message is out.
+        eprintln!("posted: {:?}", block.label);
+        next = next.with_seen(block.release_keys, []);
     }
     drop(translator);
 

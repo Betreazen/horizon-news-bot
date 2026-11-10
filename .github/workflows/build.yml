@@ -26,8 +26,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      # Only the last step uses this, to upload the binary.
+      # Used by the last step only, to upload the binary.
       contents: write
+      # Used by the attest step only, to sign a statement that this run
+      # built this binary from this commit.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -50,6 +54,13 @@ jobs:
         run: |
           cargo build --release --locked --target "$TARGET"
           ls -la "target/$TARGET/release/horizon-news-bot"
+
+      # The news run refuses a binary that lacks this signed statement, so
+      # a file swapped into the release by hand is never executed.
+      - name: Attest the binary
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: target/${{ env.TARGET }}/release/horizon-news-bot
 
       - name: Publish the binary
         env:
