@@ -75,8 +75,14 @@ jobs:
           mkdir -p llm/llama
           curl -sSfL -o llm/llama.tar.gz \
             "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_BUILD}/llama-${LLAMA_BUILD}-bin-ubuntu-x64.tar.gz"
-          curl -sSfL -o llm/model.gguf \
-            "https://huggingface.co/${MODEL_REPO}/resolve/${MODEL_REVISION}/${MODEL_FILE}"
+          # Four streams fetch the 4.7 GB model about twice as fast as one
+          # (measured: 14-15 s against 24-30 s, see docs/perf-log.md).
+          model_url="https://huggingface.co/${MODEL_REPO}/resolve/${MODEL_REVISION}/${MODEL_FILE}"
+          if command -v aria2c > /dev/null; then
+            aria2c -q -x 4 -s 4 -k 16M --file-allocation=none -d llm -o model.gguf "$model_url"
+          else
+            curl -sSfL -o llm/model.gguf "$model_url"
+          fi
           printf '%s  %s\n' "$LLAMA_SHA256" llm/llama.tar.gz "$MODEL_SHA256" llm/model.gguf | sha256sum --check
           tar -xzf llm/llama.tar.gz -C llm/llama
 
