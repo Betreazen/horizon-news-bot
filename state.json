@@ -1,7 +1,7 @@
 {
   "initialized": true,
-  "etag_list": "\"0b209646f2d4974a78a69744375c8bd99f39387753ea4bd2902a98423ca7e08a\"",
-  "etag_nightly": "\"7b989c887505cf6fea6d65416eb7eb039a3082ec2d0d3eb97ab51b4959dc867f\"",
+  "etag_list": "\"56a562bbeee53784b40eaffd4c03a683b9daa0caafc8fef440d812d4425aa152\"",
+  "etag_nightly": "\"183e2376de2bbca72a760a35976407a2505da511e953d73a67c2b936b11a522d\"",
   "seen_releases": [
     "Horizon launcher 0.2.34",
     "Horizon launcher 0.2.35",
