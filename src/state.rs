@@ -1,5 +1,5 @@
 //! What the bot remembers between runs: which releases and changelog items
-//! it has already posted, and the ETags of its last GitHub answers.
+//! it has already posted.
 
 use std::{fs, io, path::Path};
 
@@ -13,17 +13,8 @@ const MAX_SEEN_ITEMS: usize = 4000;
 pub struct State {
     /// False until the first run has recorded the releases that already existed.
     pub initialized: bool,
-    pub etag_list: Option<String>,
-    pub etag_nightly: Option<String>,
     pub seen_releases: Vec<String>,
     pub seen_items: Vec<String>,
-}
-
-/// ETags of the two GitHub requests, as they should be stored after a run.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Etags {
-    pub list: Option<String>,
-    pub nightly: Option<String>,
 }
 
 impl State {
@@ -63,16 +54,6 @@ impl State {
             initialized: true,
             seen_releases: appended(self.seen_releases, releases, MAX_SEEN_RELEASES),
             seen_items: appended(self.seen_items, items, MAX_SEEN_ITEMS),
-            ..self
-        }
-    }
-
-    #[must_use]
-    pub fn with_etags(self, etags: Etags) -> Self {
-        Self {
-            etag_list: etags.list,
-            etag_nightly: etags.nightly,
-            ..self
         }
     }
 }
@@ -120,16 +101,19 @@ mod tests {
     #[test]
     fn saved_state_loads_back_unchanged() {
         let path = std::env::temp_dir().join("horizon-news-bot-roundtrip-state.json");
-        let state = State::default()
-            .with_seen(["Nightly 1".to_string()], keys(1..4))
-            .with_etags(Etags {
-                list: Some("W/\"abc\"".to_string()),
-                nightly: None,
-            });
+        let state = State::default().with_seen(["Nightly 1".to_string()], keys(1..4));
         state.save(&path).unwrap();
         let loaded = State::load(&path);
         fs::remove_file(&path).unwrap();
         assert_eq!(loaded.unwrap(), state);
+    }
+
+    #[test]
+    fn fields_of_older_versions_are_ignored() {
+        let json = r#"{"initialized":true,"etag_list":"\"abc\"","seen_releases":["a"]}"#;
+        let state: State = serde_json::from_str(json).unwrap();
+        assert!(state.initialized);
+        assert_eq!(state.seen_releases, ["a"]);
     }
 
     #[test]

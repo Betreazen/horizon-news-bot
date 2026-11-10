@@ -2,15 +2,16 @@
 //!
 //! Two requests per run: the newest releases, and the moving `nightly`
 //! release by tag, because GitHub does not list it by publication time and
-//! a burst of launcher releases could push it off the first page. Both send
-//! the ETag of the previous answer, so an unchanged repository costs two
-//! empty 304 replies.
+//! a burst of launcher releases could push it off the first page.
+//!
+//! The requests are plain, not conditional. Release answers carry asset
+//! download counts, so their ETags change from minute to minute and
+//! `If-None-Match` never gets a 304 for a busy repository; this was
+//! measured before the idea was dropped.
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use ureq::Agent;
-
-use crate::state::{Etags, State};
 
 const USER_AGENT: &str = "horizon-news-bot";
 const PAGE_SIZE: u32 = 30;
@@ -31,65 +32,25 @@ pub struct Release {
     pub draft: bool,
 }
 
-/// Everything one run learned from GitHub.
-#[derive(Debug)]
-pub struct Snapshot {
-    pub releases: Vec<Release>,
-    /// ETags to store once this snapshot has been fully handled.
-    pub etags: Etags,
-}
-
-enum Fetched<T> {
-    NotModified,
-    Missing,
-    Fresh { value: T, etag: Option<String> },
-}
-
-pub fn fetch(
-    agent: &Agent,
-    repo: &str,
-    token: Option<&str>,
-    state: &State,
-) -> Result<Snapshot, String> {
+/// The newest releases plus the current `nightly`. The same release may
+/// appear twice; the caller tells releases apart by key.
+pub fn fetch(agent: &Agent, repo: &str, token: Option<&str>) -> Result<Vec<Release>, String> {
     let list_url = format!("https://api.github.com/repos/{repo}/releases?per_page={PAGE_SIZE}");
     let nightly_url = format!("https://api.github.com/repos/{repo}/releases/tags/nightly");
 
-    let list = get::<Vec<Release>>(agent, &list_url, token, state.etag_list.as_deref())?;
-    let nightly = get::<Release>(agent, &nightly_url, token, state.etag_nightly.as_deref())?;
-
-    let (mut releases, etag_list) = match list {
-        Fetched::Fresh { value, etag } => (value, etag),
-        Fetched::NotModified => (Vec::new(), state.etag_list.clone()),
-        Fetched::Missing => {
-            return Err(format!(
-                "repository {repo} has no releases endpoint (HTTP 404)"
-            ));
-        }
-    };
-    let etag_nightly = match nightly {
-        Fetched::Fresh { value, etag } => {
-            releases.push(value);
-            etag
-        }
-        Fetched::NotModified => state.etag_nightly.clone(),
-        Fetched::Missing => None,
-    };
-
-    Ok(Snapshot {
-        releases,
-        etags: Etags {
-            list: etag_list,
-            nightly: etag_nightly,
-        },
-    })
+    let mut releases = get::<Vec<Release>>(agent, &list_url, token)?
+        .ok_or_else(|| format!("repository {repo} was not found (HTTP 404)"))?;
+    // A repository without a `nightly` release is fine.
+    releases.extend(get::<Release>(agent, &nightly_url, token)?);
+    Ok(releases)
 }
 
+/// `None` stands for HTTP 404.
 fn get<T: DeserializeOwned>(
     agent: &Agent,
     url: &str,
     token: Option<&str>,
-    etag: Option<&str>,
-) -> Result<Fetched<T>, String> {
+) -> Result<Option<T>, String> {
     let mut request = agent
         .get(url)
         .header("Accept", "application/vnd.github+json")
@@ -98,26 +59,15 @@ fn get<T: DeserializeOwned>(
     if let Some(token) = token {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    if let Some(etag) = etag {
-        request = request.header("If-None-Match", etag);
-    }
 
     let mut response = request.call().map_err(|e| format!("GET {url}: {e}"))?;
     match response.status().as_u16() {
-        304 => Ok(Fetched::NotModified),
-        404 => Ok(Fetched::Missing),
-        200 => {
-            let etag = response
-                .headers()
-                .get("etag")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
-            let value = response
-                .body_mut()
-                .read_json::<T>()
-                .map_err(|e| format!("GET {url}: unexpected response body: {e}"))?;
-            Ok(Fetched::Fresh { value, etag })
-        }
+        200 => response
+            .body_mut()
+            .read_json::<T>()
+            .map(Some)
+            .map_err(|e| format!("GET {url}: unexpected response body: {e}")),
+        404 => Ok(None),
         code => Err(format!("GET {url}: HTTP {code}")),
     }
 }

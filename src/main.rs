@@ -25,7 +25,7 @@ use std::time::Duration;
 use ureq::Agent;
 
 use crate::digest::Plan;
-use crate::state::{Etags, State};
+use crate::state::State;
 use crate::translate::{LlamaServer, NoTranslator, Translator};
 
 const DEFAULT_SOURCE_REPO: &str = "horizon-rust/horizon";
@@ -82,41 +82,42 @@ fn run() -> Result<(), String> {
     let state = State::load(&args.state_path)?;
 
     let repo = env_value("SOURCE_REPO").unwrap_or_else(|| DEFAULT_SOURCE_REPO.to_string());
-    let snapshot = github::fetch(&agent, &repo, env_value("GITHUB_TOKEN").as_deref(), &state)?;
-    let plan = digest::plan(&snapshot.releases, &state);
+    let releases = github::fetch(&agent, &repo, env_value("GITHUB_TOKEN").as_deref())?;
+    let plan = digest::plan(&releases, &state);
     let waiting = plan.blocks.len();
     eprintln!(
         "{} release(s) fetched, {waiting} post(s) waiting, {} release(s) with nothing new",
-        snapshot.releases.len(),
+        releases.len(),
         plan.silent_releases.len()
     );
 
     match args.mode {
         Mode::Check => {
             if waiting == 0 {
-                settle(&args, state, plan.silent_releases, snapshot.etags)?;
+                settle(&args, state, plan.silent_releases)?;
             }
             println!("{waiting}");
             Ok(())
         }
-        Mode::Post if waiting == 0 => settle(&args, state, plan.silent_releases, snapshot.etags),
-        Mode::Post => post(&args, &agent, state, plan, snapshot.etags),
+        Mode::Post if waiting == 0 => settle(&args, state, plan.silent_releases),
+        Mode::Post => post(&args, &agent, state, plan),
     }
 }
 
-/// Nothing to post: remember what was looked at, so the next run is cheap.
-/// A run that learned nothing new leaves the file untouched.
-fn settle(args: &Args, state: State, silent: Vec<String>, etags: Etags) -> Result<(), String> {
-    let next = state.clone().with_seen(silent, []).with_etags(etags);
-    if args.dry_run || next == state {
+/// Nothing to post: remember the releases that held nothing new. A run
+/// that learned nothing leaves the file untouched, so a quiet day makes no
+/// commits on the state branch.
+fn settle(args: &Args, state: State, silent: Vec<String>) -> Result<(), String> {
+    let next = state.clone().with_seen(silent, []);
+    if next == state {
         return Ok(());
     }
-    next.save(&args.state_path)
+    save(args, &next)
 }
 
 /// Sends the waiting posts in order. A post counts as done only after
 /// Telegram accepted it, so a failure leaves the rest for the next run.
-fn post(args: &Args, agent: &Agent, state: State, plan: Plan, etags: Etags) -> Result<(), String> {
+fn post(args: &Args, agent: &Agent, state: State, plan: Plan) -> Result<(), String> {
     let credentials = if args.dry_run {
         None
     } else {
@@ -149,10 +150,6 @@ fn post(args: &Args, agent: &Agent, state: State, plan: Plan, etags: Etags) -> R
     }
     drop(translator);
 
-    // The ETags stay old after a failure, so the next run fetches again.
-    if failure.is_none() {
-        next = next.with_etags(etags);
-    }
     match (failure, save(args, &next)) {
         (Some(failure), Err(save_error)) => Err(format!("{failure}; and then {save_error}")),
         (Some(failure), Ok(())) => Err(failure),
