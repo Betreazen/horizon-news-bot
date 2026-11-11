@@ -1,12 +1,18 @@
 name: news
 
-# Four times a day: look for new Horizon releases and post what changed.
-# A run with nothing new ends after the check, without loading the model.
+# Every hour of the day in Minsk: look for new Horizon releases and post
+# what changed. A run with nothing new ends after the check, without
+# loading the model.
 on:
   schedule:
-    # 09:07, 13:07, 18:07 and 22:07 in Minsk (UTC+3). Off the hour on
-    # purpose: GitHub delays jobs scheduled at :00.
-    - cron: "7 6,10,15,19 * * *"
+    # 09:17 to 23:17 in Minsk (UTC+3), and nothing at night.
+    #
+    # Hourly on purpose. GitHub runs schedules when it has room: on the
+    # first day, with four slots, it ran two of them, four and five hours
+    # late. With fifteen slots the ones it drops do not matter, and news
+    # arrives within an hour or two of the release. A quiet check takes
+    # about ten seconds.
+    - cron: "17 6-20 * * *"
   workflow_dispatch:
 
 permissions:
