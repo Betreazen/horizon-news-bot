@@ -36,7 +36,8 @@
     "Horizon launcher 0.2.61",
     "Horizon launcher 0.2.62",
     "Nightly 2026-11-13 · 9f42064",
-    "Horizon launcher 0.2.63"
+    "Horizon launcher 0.2.63",
+    "Horizon launcher 0.2.64"
   ],
   "seen_items": [
     "#11894",
@@ -1624,6 +1625,7 @@
     "#15555",
     "#15627",
     "#15815",
-    "#15514"
+    "#15514",
+    "#15807"
   ]
 }
