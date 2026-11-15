@@ -39,7 +39,9 @@
     "Horizon launcher 0.2.63",
     "Horizon launcher 0.2.64",
     "Horizon launcher 0.2.65",
-    "Horizon launcher 0.2.66"
+    "Horizon launcher 0.2.66",
+    "Horizon launcher 0.2.67",
+    "Horizon launcher 0.2.68"
   ],
   "seen_items": [
     "#11894",
@@ -1634,6 +1636,12 @@
     "#16274",
     "#15829",
     "#16484",
-    "#16505"
+    "#16505",
+    "#15886",
+    "#16558",
+    "#16847",
+    "#16895",
+    "#16894",
+    "#16580"
   ]
 }
